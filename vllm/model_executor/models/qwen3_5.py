@@ -516,6 +516,16 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
         # set MoE hyperparameters
         self.set_moe_parameters()
 
+    @staticmethod
+    def specialized_decode_specs() -> tuple[DecodeSpec, ...]:
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_rocm():
+            return ()
+        from vllm.models.qwen3_5_moe.amd.specialized_decode.spec import DECODE_SPEC
+
+        return (DECODE_SPEC,)
+
 
 ########################################################
 # Qwen3_5-Dense
