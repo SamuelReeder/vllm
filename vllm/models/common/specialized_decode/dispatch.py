@@ -85,6 +85,8 @@ class SpecializedDecode(Generic[KernelT]):
         self.vllm_config = vllm_config
         self.widths = tuple(sorted(spec.widths(vllm_config)))
         self._bound = False
+        # widths whose first eager step ran vLLM's path (see _warms_vllm_path)
+        self._vllm_path_warm: set[int] = set()
         self.kernel: KernelT = spec.build(vllm_config, model, self.widths)
         kernel = self.kernel
         if isinstance(kernel, DecodeWarmable) and kernel.warmup_keys():
@@ -113,6 +115,26 @@ class SpecializedDecode(Generic[KernelT]):
             return next((w for w in self.widths if w >= width), None)
         return width if width in self.widths else None
 
+    def _warms_vllm_path(self, width: int) -> bool:
+        """Whether this step runs vLLM's path to warm it up for a piecewise CUDA
+        graph of its width.
+
+        The runner runs every CUDA graph once eagerly before capturing it, piecewise
+        graphs first. A piecewise graph of a served width runs vLLM's path, but its
+        eager warm-up would take the kernel, so vLLM's path would first run (compile
+        new shapes, autotune) inside the capture, which fails. Hence, when piecewise
+        graphs are captured, the first eager step of each width takes vLLM's path.
+        """
+        mode = self.vllm_config.compilation_config.cudagraph_mode
+        if mode is None or not mode.has_piecewise_cudagraphs():
+            return False
+        if get_forward_context().cudagraph_runtime_mode != CUDAGraphMode.NONE:
+            return False
+        if width in self._vllm_path_warm:
+            return False
+        self._vllm_path_warm.add(width)
+        return True
+
     def plan(self, positions: torch.Tensor, intermediate_tensors=None) -> Step | None:
         """This step's plan, or None to run the model's own forward instead.
 
@@ -134,6 +156,8 @@ class SpecializedDecode(Generic[KernelT]):
             why = "caches not bound"
         else:
             why = self.spec.skip_step(self.vllm_config, self.kernel, kernel_width)
+            if why is None and self._warms_vllm_path(width):
+                why = "warm-up of vLLM's path for its piecewise CUDA graph"
         if why is not None:
             logger.info_once(
                 "Specialized decode %s: step on vLLM's path (%s)", self.spec.name, why

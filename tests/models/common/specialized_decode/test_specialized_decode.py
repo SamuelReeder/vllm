@@ -307,6 +307,37 @@ def test_a_step_without_a_forward_context_takes_vllms_path(decode):
     assert decode.plan(positions(min(decode.widths))) is None
 
 
+@pytest.mark.parametrize(
+    "engine_mode, first_eager_step",
+    [
+        (CUDAGraphMode.FULL_AND_PIECEWISE, None),
+        (CUDAGraphMode.FULL, Step),
+        (CUDAGraphMode.NONE, Step),
+    ],
+)
+def test_the_first_eager_step_of_a_width_warms_vllms_path(
+    config, model, engine_mode, first_eager_step
+):
+    """The runner warms each CUDA graph eagerly before capturing it, piecewise
+    graphs first. A piecewise graph of a served width runs vLLM's path, so its
+    eager warm-up must too: the first eager step of each width takes vLLM's path
+    when piecewise graphs are captured, and every later one the kernel."""
+    config.compilation_config.cudagraph_mode = engine_mode
+    decode = make_decode(config, model)
+    small, large = decode.widths[0], decode.widths[-1]
+    with forward(config, CUDAGraphMode.NONE, {"prefill": False}):
+        first = decode.plan(positions(small))
+        second = decode.plan(positions(small))
+        other = decode.plan(positions(large))
+    if first_eager_step is None:
+        assert first is None and other is None
+    else:
+        assert isinstance(first, Step) and isinstance(other, Step)
+    assert isinstance(second, Step)
+    with forward(config, CUDAGraphMode.FULL, {"prefill": False}):
+        assert isinstance(decode.plan(positions(large)), Step)
+
+
 def test_run_takes_the_planned_step_to_the_kernel(config, model, decode):
     width = min(decode.widths)
     rows = positions(width)
