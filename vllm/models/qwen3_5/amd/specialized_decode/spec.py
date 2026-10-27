@@ -69,36 +69,38 @@ def attention_backend(layer) -> str:
 
 
 def kv_geometry(
-    kv: torch.Tensor, backend: str
+    kv: torch.Tensor, backend: str, nkv: int = NKV, head_dim: int = HEAD_DIM
 ) -> tuple[int, int, int, int, int, bool] | None:
     """(block, s0, s_head, s_pos, s_v, xpack) of an attention layer's 4-D KV view:
     the positions a block holds, the element strides of block, head and position, the
     elements from a K row to its V row, and whether the block interior is x-packed;
-    None for a cache the kernel cannot address.
+    None for a cache the kernel cannot address. nkv, head_dim: the layer's KV heads.
 
     TRITON_ATTN: the view is [blocks, NKV, block, 2 HD] (K | V per head) or [blocks, 2,
-    block, NKV HD] (a K and a V half per block), with any strides. ROCM_ATTN: the view
-    is [blocks, 2, block, NKV HD], but each half holds the paged-attention layout:
-    K [NKV][HD / 8][block][8] and V [NKV][HD][block] (ops/paged_attn.split_kv_cache)."""
+    block, NKV HD] (a K and a V half per block), with any strides; with 2 KV heads the
+    two have the same shape, and the backend's (blocks, heads, block, 2 HD) order wins.
+    ROCM_ATTN: the view is [blocks, 2, block, NKV HD], but each half holds the
+    paged-attention layout: K [NKV][HD / 8][block][8] and V [NKV][HD][block]
+    (ops/paged_attn.split_kv_cache)."""
     if kv.dim() != 4 or kv.stride(3) != 1:
         return None
     n = kv.shape[2]
     if backend == "ROCM_ATTN":
         if (
             kv.shape[1] != 2
-            or kv.shape[3] != NKV * HEAD_DIM
+            or kv.shape[3] != nkv * head_dim
             or kv.stride(2) != kv.shape[3]
         ):
             return None
         if n % 16 != 0:
             return None
-        return n, kv.stride(0), HEAD_DIM * n, 8, kv.stride(1), True
+        return n, kv.stride(0), head_dim * n, 8, kv.stride(1), True
     if backend != "TRITON_ATTN":
         return None
-    if kv.shape[1] == NKV and kv.shape[3] == 2 * HEAD_DIM:
-        return n, kv.stride(0), kv.stride(1), kv.stride(2), HEAD_DIM, False
-    if kv.shape[1] == 2 and kv.shape[3] == NKV * HEAD_DIM:
-        return n, kv.stride(0), HEAD_DIM, kv.stride(2), kv.stride(1), False
+    if kv.shape[1] == nkv and kv.shape[3] == 2 * head_dim:
+        return n, kv.stride(0), kv.stride(1), kv.stride(2), head_dim, False
+    if kv.shape[1] == 2 and kv.shape[3] == nkv * head_dim:
+        return n, kv.stride(0), head_dim, kv.stride(2), kv.stride(1), False
     return None
 
 
