@@ -61,6 +61,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.models.common.specialized_decode import SpecializedDecode, select_decode_spec
+from vllm.models.common.specialized_decode.spec import DecodeSpec
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.sequence import IntermediateTensors
@@ -359,6 +361,48 @@ class Qwen3_5ForCausalLMBase(
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+        # A whole-model decode kernel, when one serves this deployment (see
+        # docs/design/specialized_decode.md).
+        self.specialized_decode_spec = select_decode_spec(
+            vllm_config, self.specialized_decode_specs()
+        )
+        self.specialized_decode: SpecializedDecode | None = None
+
+    @staticmethod
+    def specialized_decode_specs() -> tuple[DecodeSpec, ...]:
+        """The specialized decode kernels of this model, in order of preference."""
+        return ()
+
+    def process_weights_after_loading(self) -> None:
+        # The spec gets this module, not the torch.compile'd backbone: the dispatch
+        # runs in this forward, outside the compiled region, which keeps serving
+        # prefill and the steps the kernel declines.
+        if self.specialized_decode_spec is not None and self.specialized_decode is None:
+            self.specialized_decode = SpecializedDecode(
+                self, self.vllm_config, self.specialized_decode_spec
+            )
+
+    def run_specialized_decode(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """The step's hidden states from the specialized decode kernel, or None when
+        the model's own forward takes the step."""
+        if self.specialized_decode is None:
+            return None
+        step = self.specialized_decode.plan(positions, intermediate_tensors)
+        if step is None:
+            return None
+        return self.specialized_decode.run(step, input_ids, inputs_embeds)
+
+    @staticmethod
+    def get_model_state_cls():
+        from vllm.models.qwen3_5.amd.model_state import Qwen3_5ROCMModelState
+
+        return Qwen3_5ROCMModelState
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -378,6 +422,11 @@ class Qwen3_5ForCausalLMBase(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ):
+        hidden_states = self.run_specialized_decode(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+        if hidden_states is not None:
+            return hidden_states
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -449,7 +498,15 @@ class Qwen3_5ForCausalLMBase(
 
 
 class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
-    pass
+    @staticmethod
+    def specialized_decode_specs() -> tuple[DecodeSpec, ...]:
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_rocm():
+            return ()
+        from vllm.models.qwen3_5.amd.specialized_decode.spec import DECODE_SPEC
+
+        return (DECODE_SPEC,)
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLMBase, QwenNextMixtureOfExperts):
@@ -589,6 +646,11 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
         if intermediate_tensors is not None:
             inputs_embeds = None
 
+        hidden_states = self.language_model.run_specialized_decode(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+        if hidden_states is not None:
+            return hidden_states
         hidden_states = self.language_model.model(
             input_ids=input_ids,
             positions=positions,
@@ -604,6 +666,17 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration, IsHybrid)
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    @property
+    def specialized_decode(self) -> SpecializedDecode | None:
+        return self.language_model.specialized_decode
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
+
+    @staticmethod
+    def get_model_state_cls():
+        return Qwen3_5ForCausalLMBase.get_model_state_cls()
 
     @classmethod
     def get_mamba_state_dtype_from_config(
