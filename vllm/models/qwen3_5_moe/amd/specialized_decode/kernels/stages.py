@@ -44,7 +44,7 @@ def rstd_from_ssq(c, M, ssq, red, eps):
             j = lane + 64 * i
             v = D.ldf(r, wave * ng + fx.min(j, ng - 1), cm=D.CM_DEV)
             s = s + (j < ng).select(v, fx.Float32(0.0))
-        s = D.xor_sum(s, lane, (32, 16, 8, 4, 2, 1))
+        s = D.wave_sum(s)  # DPP only, fixed order
         if lane == 0:
             fx.ptr_store(D.rsq(s / fx.Float32(float(H)) + fx.Float32(eps)), red + wave)
     gpu.barrier()

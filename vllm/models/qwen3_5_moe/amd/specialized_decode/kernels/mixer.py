@@ -21,8 +21,9 @@ wave:
   q (8 heads) and k_new: zero-centred RMSNorm over 256, NeoX RoPE on dims 0..63.
   scores (lane = position) -> partial softmax (max, sum) -> P V (lane = 4 dims).
   The chunk holding position pos writes k_new, v_new to the cache (bf16).
-  Partial record [m][j][ci]: max[6], sum[6], o[6][256] fp32. The last arriver of
-  (m, j) merges the chunks and writes o * sigmoid(gate) -> og[m][4096].
+  Partial record [m][j][ci]: max[8], sum[8], o[8][256] fp32. The o_proj prologue
+  (prologue_attn) merges the records of its head in chunk order and multiplies by
+  sigmoid(gate).
 """
 
 from __future__ import annotations
@@ -30,10 +31,11 @@ from __future__ import annotations
 import math
 
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from . import dev as D
+from . import stages as S
 from .dims import (
     A_OFF,
     B_OFF,
@@ -186,7 +188,7 @@ def rms_rope(lane, vals, w_word, cs, rope):
     bf16 norm weights (2 dwords); cs: (cos, sin) of the lane's 4 dims (dims < 32
     index)."""
     ss = vals[0] * vals[0] + vals[1] * vals[1] + vals[2] * vals[2] + vals[3] * vals[3]
-    ss = D.xor_sum(ss, lane, (1, 2, 4, 8, 16, 32))
+    ss = D.wave_sum(ss)
     rn = D.rsq(ss / fx.Float32(float(HD)) + fx.Float32(EPS))
     wf = [
         D.bf_lo(w_word[0]),
@@ -222,11 +224,11 @@ def pack_bf2(a, b):
 
 @D.traced
 def attn_task(
-    c, task, cfg, y_qkv, qn_w, kn_w, rope_cs, kv, bt, slotp, pos_ptr, rec, cnt, og, wl
+    c, task, cfg, y_qkv, qn_w, kn_w, rope_cs, kv, bt, slotp, pos_ptr, rec, wl
 ):
     """One (m, j, ci) task; wl: this wave's LDS (QW + HD floats).
     Chunk ci covers positions [p0, pe) inside KV block b = ci // cpb (see kernel.Cfg).
-    Returns nothing; the last arriver of (m, j) writes og."""
+    Writes the chunk's partial record (merged by prologue_attn)."""
     lane = c["lane"]
     D.PROBE["on"] = D.PROBE.get("stage") == "attn"
     ncmax, cpb, B = cfg.ncmax, cfg.cpb, cfg.block
@@ -258,8 +260,6 @@ def attn_task(
             rope_cs,
             base,
             rec,
-            cnt,
-            og,
             wl,
         )
 
@@ -282,8 +282,6 @@ def _attn_chunk(
     rope_cs,
     base,
     rec,
-    cnt,
-    og,
     wl,
 ):
     """base: the address of (block of p0, head j); pb: the block's first position.
@@ -413,10 +411,10 @@ def _attn_chunk(
         s_ = live.select(
             fx.ptr_load(wl + (hh * CH + lane)) * scale, fx.Float32(-3.0e38)
         )
-        mh = D.xor_max(s_, lane, (1, 2, 4, 8, 16, 32))
+        mh = D.wave_max(s_)
         ph = live.select(D.expf(s_ - mh), fx.Float32(0.0))
         mx.append(mh)
-        sm.append(D.xor_sum(ph, lane, (1, 2, 4, 8, 16, 32)))
+        sm.append(D.wave_sum(ph))
         pr.append(ph)
     # p[h][64] -> LDS (over the q region: q is no longer needed)
     for hh in range_constexpr(GQ):
@@ -434,28 +432,15 @@ def _attn_chunk(
     for b in range(0, nbat):
         o = _pv_batch(wl, b, p0, pos, vl_, vload(b), o)
     D.probe(c, 7)
-    # ---- partial record
+    # ---- partial record (merged by the o_proj prologue, prologue_attn)
     rr = D.rsrc(rec)
-    ncmax = cfg.ncmax
-    rbase = ((m * NKV + j) * ncmax + ci) * REC
+    rbase = ((m * NKV + j) * cfg.ncmax + ci) * REC
     if lane < GQ:
         D.st(_sel6(lane, mx), rr, rbase + lane, D.CM_DEV)
         D.st(_sel6(lane, sm), rr, rbase + 8 + lane, D.CM_DEV)
     for hh in range_constexpr(GQ):
         D.st(o[hh], rr, rbase + 16 + hh * HD + d0, D.CM_DEV)
-    # ---- last arriver of (m, j) merges the chunks
-    rocm_wait()
-    nchunk = (
-        pos // cfg.block * cfg.cpb + pos % cfg.block // CH + 1
-    )  # chunks up to pos's
-    old = fx.Int32(0)
-    if lane == 0:
-        old = D.atomic_add_dev(cnt + (m * NKV + j) * 4, 1)
-    old = D.uniform(old)
     D.probe(c, 8)
-    if (old + 1) % nchunk == 0:
-        _attn_merge(lane, m, j, nchunk, ncmax, ry, ybase, rr, og)
-        D.probe(c, 9)
 
 
 @D.traced
@@ -499,10 +484,6 @@ def _pv_batch(wl, b, p0, pos, vl_, vrs, o):
     return [fx.Vector.from_elements(o[hh], fx.Float32) for hh in range(GQ)]
 
 
-def rocm_wait():
-    rocdl.s_waitcnt(vmcnt=0)
-
-
 def _sel6(lane, vals):
     v = vals[0]
     for i in range(1, len(vals)):
@@ -533,52 +514,90 @@ def _load_i32x4(base_f32, idx):
     ).bitcast(fx.Int32)
 
 
-MERGE_B = 2  # chunks per merge batch
+MERGE_RB = 4  # chunk records per load batch of prologue_attn
 
 
 @D.traced
-def _attn_merge(lane, m, j, nchunk, ncmax, ry, ybase, rr, og):
-    d0 = 4 * lane
-    base = (m * NKV + j) * ncmax * REC
-    gmax = [fx.Float32(-3.0e38)] * GQ
-    tot = [fx.Float32(0.0)] * GQ
-    acc = [[fx.Float32(0.0)] * 4 for _ in range(GQ)]
-    for b0 in range(0, (nchunk + MERGE_B - 1) // MERGE_B):
+def prologue_attn(c, g, xq, xs, cfg, rec, y_qkv, pos_ptr, slotp):
+    """o_proj prologue: LDS x <- the attention output of the CTA's chunk (one head:
+    g.Kc == HD), quantized. Thread item (row t, dims d .. d + 7) merges the head's
+    chunk records in chunk order (online softmax: running max, rescaled sum and o),
+    then x = o / sum * sigmoid(gate). Rows without a KV slot (padding) give x = 0."""
+    assert g.Kc == HD and g.slots == 1
+    M, tid, NT = g.M, c["tid"], S.NT
+    S.zero_xs_tail(c, g, xs)
+    rr, ry, rp, rs = D.rsrc(rec), D.rsrc(y_qkv), D.rsrc(pos_ptr), D.rsrc(slotp)
+    h = fx.min(g.chunk0(c["bid"]), g.C - 1)  # the CTA's head
+    j, hh = h // GQ, h % GQ
+
+    def nchunk(t):
+        pos = D.ld(rp, t)
+        n = pos // cfg.block * cfg.cpb + pos % cfg.block // CH + 1  # chunks up to pos's
+        return (D.ld(rs, t) >= 0).select(n, fx.Int32(0))
+
+    nmax = fx.Int32(0)
+    for t in range_constexpr(M):
+        nmax = fx.max(nmax, D.uniform(nchunk(t)))
+    nch = M * HD // 8
+    items = []
+    for i in range_constexpr((nch + NT - 1) // NT):
+        q = fx.min(tid + NT * i, nch - 1)
+        t = q // (HD // 8)
+        d = q % (HD // 8) * 8
+        gb = t * QKV_N + h * 2 * HD + HD + d
+        gt = (D.ld(ry, gb, 4, T.f32, D.CM_DEV), D.ld(ry, gb + 4, 4, T.f32, D.CM_DEV))
+        items.append((i, t, d, nchunk(t), ((t * NKV + j) * cfg.ncmax) * REC, gt))
+    # loop-carried state per item: [max, sum, o0 .. o7] (updated in place, as the
+    # FlyDSL loop rewriter carries subscript stores)
+    st = [
+        fx.Float32(-3.0e38) if e == 0 else fx.Float32(0.0)
+        for _ in items
+        for e in range(10)
+    ]
+    for b0 in range(0, (nmax + MERGE_RB - 1) // MERGE_RB):
         recs = []
-        for k in range_constexpr(MERGE_B):
-            cidx = fx.min(b0 * MERGE_B + k, nchunk - 1)
-            ok = (b0 * MERGE_B + k) < nchunk
-            rb = base + cidx * REC
-            ms = D.ld(rr, rb, 4, T.f32, D.CM_DEV), D.ld(rr, rb + 4, 4, T.f32, D.CM_DEV)
-            ls = (
-                D.ld(rr, rb + 8, 4, T.f32, D.CM_DEV),
-                D.ld(rr, rb + 12, 4, T.f32, D.CM_DEV),
-            )
-            os_ = [
-                D.ld(rr, rb + 16 + hh * HD + d0, 4, T.f32, D.CM_DEV) for hh in range(GQ)
-            ]
-            recs.append((ok, ms, ls, os_))
-        for ok, ms, ls, os_ in recs:
-            for hh in range_constexpr(GQ):
-                mc = ms[hh // 4][hh % 4]
-                lc = ls[hh // 4][hh % 4]
+        for _, _, d, n, base, _ in items:
+            rl = []
+            for k in range_constexpr(MERGE_RB):
+                ok = (b0 * MERGE_RB + k) < n
+                rb = base + fx.min(b0 * MERGE_RB + k, fx.max(n - 1, 0)) * REC
+                rl.append(
+                    (
+                        ok,
+                        D.ldf(rr, rb + hh, cm=D.CM_DEV),
+                        D.ldf(rr, rb + 8 + hh, cm=D.CM_DEV),
+                        D.ld(rr, rb + 16 + hh * HD + d, 4, T.f32, D.CM_DEV),
+                        D.ld(rr, rb + 16 + hh * HD + d + 4, 4, T.f32, D.CM_DEV),
+                    )
+                )
+            recs.append(rl)
+        for q in range_constexpr(len(items)):
+            for ok, mc, lc, o0, o1 in recs[q]:
                 mc = ok.select(mc, fx.Float32(-3.0e38))
-                nm = fx.max(gmax[hh], mc)
-                a_old = D.expf(gmax[hh] - nm)
+                nm = fx.max(st[10 * q], mc)
+                a_old = D.expf(st[10 * q] - nm)
                 a_new = ok.select(D.expf(mc - nm), fx.Float32(0.0))
-                tot[hh] = tot[hh] * a_old + lc * a_new
-                for e in range_constexpr(4):
-                    acc[hh][e] = acc[hh][e] * a_old + os_[hh][e] * a_new
-                gmax[hh] = nm
-    ro = D.rsrc(og)
-    for hh in range_constexpr(GQ):
-        h = j * GQ + hh
-        gt = D.ld(ry, ybase + h * 2 * HD + HD + d0, 4, T.f32, D.CM_DEV)
-        inv = fx.Float32(1.0) / tot[hh]
-        vals = [acc[hh][e] * inv * D.sigmoid(gt[e]) for e in range(4)]
-        D.st(
-            fx.Vector.from_elements(vals, fx.Float32),
-            ro,
-            m * NQ * HD + h * HD + d0,
-            D.CM_DEV,
-        )
+                st[10 * q + 1] = st[10 * q + 1] * a_old + lc * a_new
+                ov = [o0[0], o0[1], o0[2], o0[3], o1[0], o1[1], o1[2], o1[3]]
+                for e in range_constexpr(8):
+                    st[10 * q + 2 + e] = st[10 * q + 2 + e] * a_old + ov[e] * a_new
+                st[10 * q] = nm
+    for q in range_constexpr(len(items)):
+        i, t, d, n, _, gt = items[q]
+        inv = fx.Float32(1.0) / st[10 * q + 1]
+        gv = [
+            gt[0][0],
+            gt[0][1],
+            gt[0][2],
+            gt[0][3],
+            gt[1][0],
+            gt[1][1],
+            gt[1][2],
+            gt[1][3],
+        ]
+        x = [
+            (n > 0).select(st[10 * q + 2 + e] * inv * D.sigmoid(gv[e]), fx.Float32(0.0))
+            for e in range(8)
+        ]
+        S.store_quant8(c, g, xq, xs, x, t, d, tid + NT * i < nch)
+    gpu.barrier()
