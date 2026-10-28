@@ -13,6 +13,14 @@ positions, slot mappings, block tables and state indices into the kernel's own b
 barrier's epoch lives on the device. A hybrid model's KV cache groups share the cache
 memory, so a request has its own blocks and state slots in each group: every layer
 reads the indices of its group.
+
+Tensor parallel 2: each rank runs the same kernel on its shards of the weights and
+caches (vLLM's TP layout), and the launch all-reduces the row-parallel outputs and
+exchanges the embedding rows over peer memory (``PeerBuffer`` of DSv4.1's mono
+decode). The mailbox tags come from the grid barrier's epoch, so all widths share one
+epoch word and one peer buffer, and both ranks must run the same launches in the same
+order. The step plan depends only on the scheduler output, which every rank receives
+identically (``VLLM_SPECIALIZED_DECODE_CHECK_PATHS`` checks it).
 """
 
 from collections.abc import Mapping
@@ -20,26 +28,16 @@ from typing import Any
 
 import torch
 
+from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.models.common.specialized_decode.guards import tp_agree
 from vllm.models.common.specialized_decode.spec import Step
 
 from ..kernels import kernel as KK
 from ..kernels import mixer as X
-from ..kernels.dims import (
-    FFN,
-    INP_N,
-    NKV,
-    NL,
-    NVH,
-    QKV_N,
-    ROT,
-    THETA,
-    VAL_DIM,
-    H,
-    is_attn,
-)
-from ..spec import attention_backend, kv_geometry
+from ..kernels.dims import NL, ROT, THETA, Dims, H, is_attn
+from ..spec import attention_backend, kv_geometry, tp_size
 from .weights import PackedWeights
 
 logger = init_logger(__name__)
@@ -58,7 +56,10 @@ class Qwen35Gfx942Decode:
     bindings."""
 
     def __init__(self, vllm_config, lm, widths: tuple[int, ...]):
-        """lm: the loaded Qwen3_5ForCausalLM (``lm.model`` is the backbone)."""
+        """lm: the loaded Qwen3_5ForCausalLM (``lm.model`` is the backbone).
+
+        At TP 2 the constructor is collective over the TP group (the peer buffer's
+        handle exchange): every rank builds it at model load."""
         self.vllm_config = vllm_config
         self.widths = widths
         self.model = lm.model
@@ -74,22 +75,55 @@ class Qwen35Gfx942Decode:
         self.cache_layers = tuple(self.attn_names + self.gdn_names)
         self.maxlen = vllm_config.model_config.max_model_len
         self.cus = torch.cuda.get_device_properties(device).multi_processor_count
-        self.weights = PackedWeights(layers)
+        self.tp = tp_size(vllm_config)
+        d = self.d = Dims(self.tp)
+        group = get_tp_group() if self.tp > 1 else None
+        self.rank = group.rank_in_group if group is not None else 0
+        # the embedding is read in place: rank r holds vocab rows [r V / tp, ...)
+        # (VocabParallelEmbedding, no padding as tp divides the vocab)
+        emb = self.model.embed_tokens
+        assert emb.weight.shape[0] == d.vocab, tuple(emb.weight.shape)
+        if self.tp > 1:
+            assert emb.shard_indices.org_vocab_start_index == d.vocab_off(self.rank)
+        # every rank must reach the peer buffer's collective: agree first on the
+        # packing, which can fail on one rank (out of memory)
+        failure: Exception | None = None
+        try:
+            self.weights = PackedWeights(layers, self.tp)
+        except Exception as err:
+            failure = err
+        if not tp_agree(failure is None, group.cpu_group if group else None):
+            raise RuntimeError(
+                "Qwen3.8 gfx942 decode: weight packing failed on "
+                f"{'this' if failure else 'another'} TP rank"
+            ) from failure
+        self.peer = None
+        if self.tp > 1:
+            from vllm.models.deepseek_v41.amd.mono.common.peer_memory import (
+                PeerBuffer,
+            )
+
+            self.peer = PeerBuffer(
+                KK.peer_bytes(self.tp), group.cpu_group, self.rank, self.tp, device
+            )
+            self.peer.bytes.zero_()
         Mx = max(widths)
         z = lambda *s, dt=torch.float32: torch.zeros(*s, dtype=dt, device=device)  # noqa: E731
         self.hb = z(3, Mx, H)
         self.ssq = z(2, Mx, H // 16)
-        self.y = z(Mx, max(INP_N, QKV_N, 2 * FFN))
-        self.y2 = z(Mx, VAL_DIM)
-        self.hssq = z(Mx, NVH, 8)
+        self.y = z(Mx, max(d.inp_n, d.qkv_n, 2 * d.ffn))
+        self.y2 = z(Mx, d.val_dim)
+        self.hssq = z(Mx, d.nvh, 8)
         self.cnt = z(8 * KK.CNT_STRIDE, dt=torch.int32)
+        # one flag buffer (grid barrier lines and epoch word) for every width
         self.flags = z((self.cus + KK.EPOCH_WORD_LINE + 1) * 32, dt=torch.int32)
         self.tok = z(Mx, dt=torch.int32)
         self.pos = z(Mx, dt=torch.int32)
-        self.out = z(Mx, H, dt=self.model.embed_tokens.weight.dtype)
+        self.out = z(Mx, H, dt=emb.weight.dtype)
         # a step handed embeddings (a multimodal model's decode) reads them as a table
-        # of Mx rows indexed by row
-        self.emb = z(Mx, H, dt=self.model.embed_tokens.weight.dtype)
+        # of Mx rows indexed by row. Rows 0 .. Mx - 1 are vocab ids of rank 0, so at
+        # TP 2 rank 0 sends its rows to rank 1 (the ranks hold the same embeddings).
+        self.emb = z(Mx, H, dt=emb.weight.dtype)
         self.iota = torch.arange(Mx, dtype=torch.int32, device=device)
         self.rope = rope_table(self.maxlen, device)
         self.launches: dict[int, Any] = {}
@@ -130,7 +164,9 @@ class Qwen35Gfx942Decode:
         kv0 = caches[self.attn_names[0]]
         conv0, ssm0 = caches[self.gdn_names[0]]
         sfc = self.vllm_config.compilation_config.static_forward_context
-        geometry = kv_geometry(kv0, attention_backend(sfc[self.attn_names[0]]))
+        geometry = kv_geometry(
+            kv0, attention_backend(sfc[self.attn_names[0]]), self.d.nkv
+        )
         assert geometry is not None
         block, s0, s1, s2, sv, xpack = geometry
         maxblocks = -(-self.maxlen // block)
@@ -148,7 +184,11 @@ class Qwen35Gfx942Decode:
                 xpack,
                 conv0.stride(0) * conv0.element_size(),
                 ssm0.stride(0) * ssm0.element_size(),
-                lm_head=False,
+                lm_head=False,  # vLLM's (vocab-parallel) LM head makes the logits
+                tp=self.tp,
+                ar_dtype="fp32",
+                ar_local=False,
+                chunks=self.weights.chunks,
             )
             if self.cfgs.get(w) != cfg:
                 self.cfgs[w] = cfg
@@ -158,7 +198,7 @@ class Qwen35Gfx942Decode:
         self.part = torch.zeros(
             max(c.part_floats() for c in self.cfgs.values()), device=self.device
         )
-        self.rec = torch.zeros(Mx * NKV * cfg.ncmax * X.REC, device=self.device)
+        self.rec = torch.zeros(Mx * self.d.nkv * cfg.ncmax * X.REC, device=self.device)
         self.attn_groups, attn_group = self._group_of(self.attn_names)
         self.gdn_groups, gdn_group = self._group_of(self.gdn_names)
         zi = lambda *s: torch.zeros(*s, dtype=torch.int32, device=self.device)  # noqa: E731
@@ -190,6 +230,9 @@ class Qwen35Gfx942Decode:
             self.pos.data_ptr(),
         )
         g[KK.G_OUT] = self.out.data_ptr()
+        if self.peer is not None:
+            g[KK.G_PEERS] = self.peer.addresses.data_ptr()
+            g[KK.G_RANK] = self.rank
         self.glob = torch.tensor(g, dtype=torch.int64, device=self.device)
         g[KK.G_EMBED], g[KK.G_TOK] = self.emb.data_ptr(), self.iota.data_ptr()
         self.glob_emb = torch.tensor(g, dtype=torch.int64, device=self.device)
@@ -239,8 +282,10 @@ class Qwen35Gfx942Decode:
             )
         self.tab = tab.to(self.device)
         logger.info(
-            "Qwen3.8 gfx942 decode: KV block %d, %d block-table columns, %d attention "
-            "and %d GDN cache groups, widths %s",
+            "Qwen3.8 gfx942 decode: TP rank %d of %d, KV block %d, %d block-table "
+            "columns, %d attention and %d GDN cache groups, widths %s",
+            self.rank,
+            self.tp,
             block,
             maxblocks,
             len(self.attn_groups),
