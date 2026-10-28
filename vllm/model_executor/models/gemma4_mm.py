@@ -45,6 +45,7 @@ from vllm.model_executor.models.gemma3n_mm import batch_audio_features
 from vllm.model_executor.models.gemma4 import Gemma4ForCausalLM
 from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.transformers.utils import recursive_replace_linear
+from vllm.models.common.specialized_decode import SpecializedDecode
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -2155,6 +2156,12 @@ class Gemma4ForConditionalGeneration(
         if intermediate_tensors is not None:
             inputs_embeds = None
 
+        hidden_states = self.language_model.run_specialized_decode(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+        if hidden_states is not None:
+            return hidden_states
+
         # Select the pre-cached PLEs for this batch (None when PLE
         # is disabled for variants without PLE).
         per_layer_inputs = (
@@ -2179,6 +2186,17 @@ class Gemma4ForConditionalGeneration(
         )
 
         return hidden_states
+
+    @property
+    def specialized_decode(self) -> SpecializedDecode | None:
+        return self.language_model.specialized_decode
+
+    def process_weights_after_loading(self) -> None:
+        self.language_model.process_weights_after_loading()
+
+    @staticmethod
+    def get_model_state_cls():
+        return Gemma4ForCausalLM.get_model_state_cls()
 
     def compute_logits(
         self,

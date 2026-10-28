@@ -60,6 +60,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.models.common.specialized_decode import SpecializedDecode, select_decode_spec
+from vllm.models.common.specialized_decode.spec import DecodeSpec
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.triton_utils import tl, triton
@@ -1497,6 +1499,53 @@ class Gemma4ForCausalLM(
         self.num_expert_groups = 1
         self.num_shared_experts = 0
         self.num_redundant_experts = 0
+        # A whole-model decode kernel, when one serves this deployment (see
+        # docs/design/specialized_decode.md).
+        self.vllm_config = vllm_config
+        self.specialized_decode_spec = select_decode_spec(
+            vllm_config, self.specialized_decode_specs()
+        )
+        self.specialized_decode: SpecializedDecode | None = None
+
+    @staticmethod
+    def specialized_decode_specs() -> tuple[DecodeSpec, ...]:
+        """The specialized decode kernels of this model, in order of preference."""
+        if not current_platform.is_rocm():
+            return ()
+        from vllm.models.gemma4.amd.specialized_decode.spec import DECODE_SPEC
+
+        return (DECODE_SPEC,)
+
+    def process_weights_after_loading(self) -> None:
+        # The spec gets this module, not the torch.compile'd backbone: the dispatch
+        # runs in this forward, outside the compiled region, which keeps serving
+        # prefill and the steps the kernel declines.
+        if self.specialized_decode_spec is not None and self.specialized_decode is None:
+            self.specialized_decode = SpecializedDecode(
+                self, self.vllm_config, self.specialized_decode_spec
+            )
+
+    def run_specialized_decode(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None,
+        inputs_embeds: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        """The step's hidden states from the specialized decode kernel, or None when
+        the model's own forward takes the step."""
+        if self.specialized_decode is None:
+            return None
+        step = self.specialized_decode.plan(positions, intermediate_tensors)
+        if step is None:
+            return None
+        return self.specialized_decode.run(step, input_ids, inputs_embeds)
+
+    @staticmethod
+    def get_model_state_cls():
+        from vllm.models.gemma4.amd.model_state import Gemma4ROCMModelState
+
+        return Gemma4ROCMModelState
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1509,6 +1558,11 @@ class Gemma4ForCausalLM(
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        hidden_states = self.run_specialized_decode(
+            input_ids, positions, intermediate_tensors, inputs_embeds
+        )
+        if hidden_states is not None:
+            return hidden_states
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs
         )
