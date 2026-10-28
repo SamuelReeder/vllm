@@ -54,6 +54,11 @@ PER_LAYER = {
     "num_global_key_value_heads",
     "global_head_dim",
 }
+# Keys of the checkpoint config the kernel does not depend on in vLLM: vLLM runs the LM
+# head itself (Cfg.lm_head False), and its text config of the Gemma 4 checkpoints reads
+# tie_word_embeddings False although config.json says true (observed on
+# RedHatAI/gemma-4-26B-A4B-it-FP8-dynamic).
+NOT_READ = {"tie_word_embeddings"}
 # The FP8 linear layers the kernel repacks, as vLLM fuses them: (rows, columns) of
 # each layer type. A full layer's qkv_proj holds [q | k | v = k] (attention_k_eq_v:
 # vLLM loads k_proj into both shards); the kernel reads its q and k rows.
@@ -124,7 +129,7 @@ def _refuse_config(vllm_config) -> list[str]:
     model_config = vllm_config.model_config
     text = model_config.hf_text_config
     for key, want in CONFIG.items():
-        if key in PER_LAYER:
+        if key in PER_LAYER or key in NOT_READ:
             continue
         if getattr(text, key, None) != want:
             reasons.append(
@@ -251,6 +256,15 @@ def _refuse_caches(vllm_config, decode: "Gemma4Gfx942Decode", caches) -> list[st
     return reasons
 
 
+def _gemma_widths(vllm_config) -> tuple[int, ...]:
+    """The widths the kernel serves: 1 and 2. On real text in vLLM (512-token prompts,
+    MI300X) the kernel takes 3.57 / 4.20 / 5.20 / 6.94 ms per step at batch 1 / 2 / 4 /
+    8 and vLLM's own path 4.41 / 4.64 / 5.22 / 6.12 ms: no gain at 4, a loss at 8
+    (megakernels gemma4-26b-a4b-gfx942/docs/DESIGN.md, "Milestone 6"). Wider steps
+    take vLLM's path with its CUDA graphs."""
+    return tuple(w for w in _widths(vllm_config) if w <= 2)
+
+
 def _build(vllm_config, lm, widths: tuple[int, ...]) -> "Gemma4Gfx942Decode":
     from .runtime.decode import Gemma4Gfx942Decode
 
@@ -260,7 +274,7 @@ def _build(vllm_config, lm, widths: tuple[int, ...]) -> "Gemma4Gfx942Decode":
 DECODE_SPEC = DecodeSpec["Gemma4Gfx942Decode"](
     name="gemma4-26b-a4b-fp8-gfx942",
     supports=frozenset(),
-    widths=_widths,
+    widths=_gemma_widths,
     refuse_config=_refuse_config,
     refuse_model=_refuse_model,
     refuse_caches=_refuse_caches,
