@@ -34,22 +34,7 @@ from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from . import dev as D
-from .dims import (
-    A_OFF,
-    B_OFF,
-    DK,
-    EPS,
-    HD,
-    INP_N,
-    K_OFF,
-    NKV,
-    NQ,
-    NVH,
-    Q_OFF,
-    QKV_N,
-    V_OFF,
-    Z_OFF,
-)
+from .dims import DK, EPS, HD, NKV, NQ
 
 CH = 64  # attention positions per task
 PVB = 16  # P V: positions per load batch
@@ -68,6 +53,16 @@ def gdn_task(
     sidx[m] (0: a padding row, whose state is not written). wl: this wave's LDS (256
     floats: q[128] k[128])."""
     lane = c["lane"]
+    d = D.TRACE["d"]
+    NVH, INP_N = d.nvh, d.inp_n
+    Q_OFF, K_OFF, V_OFF, Z_OFF, B_OFF, A_OFF = (
+        d.q_off,
+        d.k_off,
+        d.v_off,
+        d.z_off,
+        d.b_off,
+        d.a_off,
+    )
     D.PROBE["on"] = D.PROBE.get("stage") == "gdn"
     D.probe(c, 4)
     m = task // (NVH * 8)
@@ -226,6 +221,7 @@ def attn_task(
     Chunk ci covers positions [p0, pe) inside KV block b = ci // cpb (see kernel.Cfg).
     Returns nothing; the last arriver of (m, j) writes og."""
     lane = c["lane"]
+    NKV = D.TRACE["d"].nkv
     D.PROBE["on"] = D.PROBE.get("stage") == "attn"
     ncmax, cpb, B = cfg.ncmax, cfg.cpb, cfg.block
     m = task // (NKV * ncmax)
@@ -288,6 +284,8 @@ def _attn_chunk(
     Plain layout: position p's K is at base + (p - pb) kv_s2 bf16 elements, its V kv_sv
     later. x-packed layout (vLLM's ROCM_ATTN): the head's K is [HD / 8][block][8] and
     its V, kv_sv elements later, [HD][block]."""
+    d = D.TRACE["d"]
+    NQ, NKV, QKV_N = d.nq, d.nkv, d.qkv_n
     ry = D.rsrc(y_qkv)
     ybase = m * QKV_N
     d0 = 4 * lane
@@ -452,7 +450,7 @@ def _attn_chunk(
     old = D.uniform(old)
     D.probe(c, 8)
     if (old + 1) % nchunk == 0:
-        _attn_merge(lane, m, j, nchunk, ncmax, ry, ybase, rr, og)
+        _attn_merge(lane, d, m, j, nchunk, ncmax, ry, ybase, rr, og)
         D.probe(c, 9)
 
 
@@ -535,7 +533,8 @@ MERGE_B = 2  # chunks per merge batch
 
 
 @D.traced
-def _attn_merge(lane, m, j, nchunk, ncmax, ry, ybase, rr, og):
+def _attn_merge(lane, d, m, j, nchunk, ncmax, ry, ybase, rr, og):
+    NQ, NKV = d.nq, d.nkv
     d0 = 4 * lane
     base = (m * NKV + j) * ncmax * REC
     gmax = [fx.Float32(-3.0e38)] * GQ

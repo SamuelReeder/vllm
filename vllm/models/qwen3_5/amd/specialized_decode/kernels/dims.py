@@ -31,3 +31,36 @@ N_ATT = NL // 4  # 16
 
 def is_attn(i: int) -> bool:
     return i % 4 == 3
+
+
+class Dims:
+    """The widths one tensor-parallel rank holds (vLLM's TP layout, docs/DESIGN-TP2.md
+    section 4). tp = 1 gives the module constants above.
+
+    GDN in_proj columns of a rank: [q | k | v | z | b | a] of its key heads and value
+    heads; attention qkv: [its q heads (q | gate per head) | its KV heads' k | v]; MLP
+    gate/up: its FFN slice; LM head and embedding: its vocab slice [vocab_off(rank),
+    + vocab). Row-parallel GEMVs (out / o_proj, down) take the K slice of the same
+    heads / FFN columns."""
+
+    def __init__(self, tp: int = 1):
+        assert tp in (1, 2), "TP 1 or 2"
+        self.tp = tp
+        self.nkh, self.nvh = NKH // tp, NVH // tp
+        self.key_dim, self.val_dim = KEY_DIM // tp, VAL_DIM // tp
+        self.conv_dim = 2 * self.key_dim + self.val_dim
+        self.inp_n = self.conv_dim + self.val_dim + 2 * self.nvh
+        self.q_off, self.k_off, self.v_off = 0, self.key_dim, 2 * self.key_dim
+        self.z_off = self.conv_dim
+        self.b_off = self.conv_dim + self.val_dim
+        self.a_off = self.b_off + self.nvh
+        self.nq, self.nkv = NQ // tp, NKV // tp
+        self.qkv_n = 2 * self.nq * HD + 2 * self.nkv * HD
+        self.ffn = FFN // tp
+        self.vocab = VOCAB // tp
+
+    def vocab_off(self, rank):
+        return rank * self.vocab
+
+    def __repr__(self):
+        return f"Dims(tp={self.tp})"

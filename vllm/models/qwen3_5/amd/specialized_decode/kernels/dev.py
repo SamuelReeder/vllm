@@ -19,6 +19,7 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 CM_DEV = 16
+CM_SYS = 17  # sc0 | sc1: system scope (peer GPUs over XGMI)
 CM_NT = 2
 LINE = 32  # i32 per 128 B cache line
 
@@ -76,6 +77,14 @@ def opaque_s(v):
             has_side_effects=True,
         ).result
     )
+
+
+def opaque64(v):
+    """Wave-uniform i64 version of opaque_s (two s_mov)."""
+    v = fx.Int64(v)
+    hi = opaque_s(fx.Int32(v >> 32))
+    lo = opaque_s(fx.Int32(v & 0xFFFFFFFF))
+    return (fx.Int64(hi) << 32) | fx.Int64(fx.Uint32(lo))
 
 
 def opaque_v(v):
@@ -205,6 +214,20 @@ def silu(x):
     return fx.Float32(x) * sigmoid(x)
 
 
+def bf16_pair(a, b):
+    """Two f32 -> one f32-typed word holding (bf16(a), bf16(b)), RNE."""
+    return (
+        fx.Vector.from_elements([a, b], fx.Float32)
+        .to(fx.BFloat16)
+        .bitcast(fx.Float32)[0]
+    )
+
+
+def bf16r(v):
+    """f32 rounded to bf16 (RNE) and back."""
+    return fx.Float32(fx.Float32(v).to(fx.BFloat16))
+
+
 def bf_lo(w):
     return (fx.Int32(w) << 16).bitcast(fx.Float32)
 
@@ -301,7 +324,44 @@ def atomic_add_dev(addr, v):
     )
 
 
+# Trace-time constants of the kernel being traced (kernel.build's launch sets them
+# before its body traces): "d" the rank's Dims, "ar" the all-reduce config or None.
+# Python values cannot ride in the stage dict c, which the layer loop carries as IR.
+TRACE = {}
+
 PROBE = {"addr": None}  # debug: global address of an i64 array [CTA * 8 + wave][16]
+
+# debug (TP > 1): all-reduce timing split, docs/DESIGN-TP2.md section 11. "bar": i64
+# [barrier][CUS][4] = (arrive, drained, released, 0) per CTA, where "drained" is after
+# the CTA's s_waitcnt vmcnt(0) (its peer stores acknowledged). "wave": i64
+# [barrier][CUS * 8 + wave][4] = (push, poll start, poll end, group) of the last
+# all-reduce epilogue the wave ran in the stage that starts at that barrier.
+ARPROBE = {"bar": None, "wave": None}
+
+
+def drain_cta():
+    """Wait for every memory op of every wave of the CTA (the s_waitcnt of grid_arrive,
+    taken earlier so a stamp can follow it)."""
+    rocdl.s_waitcnt(vmcnt=0)
+    gpu.barrier()
+
+
+def st_stamps(addr, i, a, b):
+    """Store the i64 pair (a, b) at i64 index i of addr."""
+    a, b = fx.Int64(a), fx.Int64(b)
+    st(
+        fx.Vector.from_elements(
+            [
+                fx.Int32(a & 0xFFFFFFFF),
+                fx.Int32(a >> 32),
+                fx.Int32(b & 0xFFFFFFFF),
+                fx.Int32(b >> 32),
+            ],
+            fx.Int32,
+        ),
+        rsrc(addr),
+        i * 2,
+    )
 
 
 def probe(c, slot):
