@@ -29,7 +29,7 @@ values and sums do not depend on M or on the other rows.
 from __future__ import annotations
 
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from . import dev as D
@@ -127,11 +127,13 @@ def _epi_ssq_t(c, M, grp, tot, out, ssq):
 
 class EpiDE:
     """Expert-down epilogue (moe._reduce_down): tots = [e, d]; stores both raw with their
-    16-column sums of squares."""
+    16-column sums of squares. done (Cfg.combine_rows): then, if `count`, adds the group
+    to the device counter `done` that the combine CTAs wait on."""
 
-    def __init__(self, c, M, e, ssq_e, d, ssq_d):
+    def __init__(self, c, M, e, ssq_e, d, ssq_d, done=None, count=None):
         self.c, self.M = c, M
         self.e, self.ssq_e, self.d, self.ssq_d = e, ssq_e, d, ssq_d
+        self.done, self.count = done, count
 
     def pre(self, grp):
         return None
@@ -148,6 +150,15 @@ class EpiDE:
             self.d,
             self.ssq_d,
         )
+        if const_expr(self.done is not None):
+            _count_done(self.c, self.done, self.count)
+
+
+@D.traced
+def _count_done(c, done, count):
+    rocdl.s_waitcnt(vmcnt=0)  # this group's stores before its count
+    if count & (c["lane"] == 0):
+        D.atomic_add_dev(done, 1)
 
 
 @D.traced
@@ -161,6 +172,7 @@ def prologue_scaled(c, g, xq, xs, y):
     """LDS x <- y (fp32 [M][K]) for the CTA's chunk slots, quantized (the o_proj input)."""
     M = g.M
     tid = c["tid"]
+    _probe_on(c, g.name, 5)
     zero_xs_tail(c, g, xs)
     ry = D.rsrc(y)
     ch0 = g.chunk0(c["bid"])
@@ -180,9 +192,16 @@ def prologue_scaled(c, g, xq, xs, y):
         x = [a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]]
         store_quant8(c, g, xq, xs, x, t, sl * g.Kc + kc, tid + NT * i < nch)
     gpu.barrier()
+    D.probe(c, 8)
 
 
 # ---------------------------------------------------------------- whole-row prologues
+
+
+def _probe_on(c, name, slot):
+    """Debug: probe stamps of the stage `name` (bench/profile_decode.py PROBE=name)."""
+    D.PROBE["on"] = D.PROBE.get("stage") == name
+    D.probe(c, slot)
 
 
 def _oct(c):
@@ -257,13 +276,14 @@ def _sq8(v, live):
 
 
 @D.traced
-def rebuild_h(c, M, red, h1, d, e, ssq_d, ssq_e, w1, w2, wpf, ls, h_out):
+def rebuild_h(c, M, red, h1, d, e, ssq_d, ssq_e, w1, w2, wpf, ls, h_out, name=""):
     """The residual at a layer start (docs/DESIGN.md "Stages"):
     h = (h1 + rms(rms(d) w1 + rms(e) w2) wpf) * layer_scalar, per row in fp32 (rms(x) = x
     * rsqrt(mean(x^2) + eps)). Returns ([M] lists of the thread's 8 values, k0, live)
     and leaves rstd(h) in red[64 + 3 * 8 + t]. CTA 0 stores h to h_out. Layer 0: h1 = the
     scaled embedding, d = e = 0, w = 1, layer_scalar = 1 gives h = h1 exactly."""
     k0, live = _oct(c)
+    _probe_on(c, name, 5)
     rstd_from_ssq(c, M, ssq_d, red, 0)
     rstd_from_ssq(c, M, ssq_e, red, 1)
     rd, re_, r1 = D.rsrc(d), D.rsrc(e), D.rsrc(h1)
@@ -282,6 +302,7 @@ def rebuild_h(c, M, red, h1, d, e, ssq_d, ssq_e, w1, w2, wpf, ls, h_out):
     # h1 loads after d, e are consumed (register pressure at M = 8); the reduction's
     # barriers cover their latency
     hv = [_ld8(r1, t * H + k0) for t in range(M)]
+    D.probe(c, 6)
     _rows_rstd(c, M, parts, red, 2)
     hh, parts = [], []
     ro = D.rsrc(h_out)
@@ -299,6 +320,7 @@ def rebuild_h(c, M, red, h1, d, e, ssq_d, ssq_e, w1, w2, wpf, ls, h_out):
                 D.CM_DEV,
             )
     _rows_rstd(c, M, parts, red, 3)
+    D.probe(c, 7)
     return hh, k0, live
 
 
@@ -314,6 +336,41 @@ def prologue_qkv(c, g, xq, xs, red, hh, k0, live, lnw):
         x = [hh[t][q] * rs * wv[q] for q in range(8)]
         store_quant8(c, g, xq, xs, x, t, k0, live)
     gpu.barrier()
+    D.probe(c, 8)
+
+
+@D.traced
+def combine_row(
+    c, m, red, h1, d, e, ssq_d, ssq_e, w1, w2, wpf, ls, lnw, h_out, xg, xgs
+):
+    """Down stage, CTA cus - M + m (Cfg.combine_rows): row m of rebuild_h (the same
+    arithmetic and sum orders: the same bits) -> h_out, and the next layer's qkv input
+    x = h * rstd(h) * input_layernorm quantized as prologue_qkv does -> xg fp8 [M][H] and
+    xgs scales [M][H / 128]."""
+    k0, live = _oct(c)
+    _rstd_row(c, ssq_d, red, 0, m)
+    _rstd_row(c, ssq_e, red, 1, m)
+    dv = _ld8(D.rsrc(d), m * H + k0)
+    ev = _ld8(D.rsrc(e), m * H + k0)
+    hv = _ld8(D.rsrc(h1), m * H + k0)
+    a1, a2, af = _w8(D.rsrc(w1), k0), _w8(D.rsrc(w2), k0), _w8(D.rsrc(wpf), k0)
+    wv = _w8(D.rsrc(lnw), k0)
+    lsv = D.bf_lo(D.ld(D.rsrc(ls), 0))
+    gpu.barrier()
+    rdt, ret = fx.ptr_load(red + 64), fx.ptr_load(red + (64 + 8))
+    s = [dv[q] * rdt * a1[q] + ev[q] * ret * a2[q] for q in range(8)]
+    _rows_rstd(c, 1, [_sq8(s, live)], red, 2)
+    rs = fx.ptr_load(red + (64 + 16))
+    ht = [(hv[q] + s[q] * rs * af[q]) * lsv for q in range(8)]
+    ro = D.rsrc(h_out)
+    if live:
+        D.st(fx.Vector.from_elements(ht[:4], fx.Float32), ro, m * H + k0, D.CM_DEV)
+        D.st(fx.Vector.from_elements(ht[4:], fx.Float32), ro, m * H + k0 + 4, D.CM_DEV)
+    _rows_rstd(c, 1, [_sq8(ht, live)], red, 3)
+    rh = fx.ptr_load(red + (64 + 24))
+    _quant8_g(
+        c, [ht[q] * rh * wv[q] for q in range(8)], D.rsrc(xg), D.rsrc(xgs), m, k0, live
+    )
 
 
 @D.traced
@@ -339,12 +396,16 @@ def prologue_final(c, M, xq, xr, red, hh, k0, live, lnw, out, lm_head):
 
 
 @D.traced
-def prologue_router(c, g, xq, red, h, a, ssq_a, wpa, rscale, h1_out, rstd1_out):
+def prologue_router(
+    c, g, xq, red, h, a, ssq_a, wpa, rscale, h1_out, rstd1_out, store=True
+):
     """Router GEMV input (bf16, all K): h1 = h + rms(a) * post_attention_layernorm;
-    x = bf16(rms(h1) * H^-0.5 * router.scale). CTA 0 stores h1 and rstd(h1)."""
+    x = bf16(rms(h1) * H^-0.5 * router.scale). store: CTA 0 stores h1 and rstd(h1) (else
+    publish_row does)."""
     assert g.C == 1 and g.K == H and g.kind == "bf16"
     M = g.M
     k0, live = _oct(c)
+    _probe_on(c, g.name, 5)
     rstd_from_ssq(c, M, ssq_a, red, 0)
     rh, ra = D.rsrc(h), D.rsrc(a)
     hv = [_ld8(rh, t * H + k0) for t in range(M)]
@@ -359,15 +420,22 @@ def prologue_router(c, g, xq, red, h, a, ssq_a, wpa, rscale, h1_out, rstd1_out):
         ht = [hv[t][q] + av[t][q] * rat * wv[q] for q in range(8)]
         h1.append(ht)
         parts.append(_sq8(ht, live))
-        if (c["bid"] == 0) & live:
-            D.st(fx.Vector.from_elements(ht[:4], fx.Float32), ro, t * H + k0, D.CM_DEV)
-            D.st(
-                fx.Vector.from_elements(ht[4:], fx.Float32),
-                ro,
-                t * H + k0 + 4,
-                D.CM_DEV,
-            )
+        if const_expr(store):  # noqa: SIM102 (trace-time test, then a run-time one)
+            if (c["bid"] == 0) & live:
+                D.st(
+                    fx.Vector.from_elements(ht[:4], fx.Float32),
+                    ro,
+                    t * H + k0,
+                    D.CM_DEV,
+                )
+                D.st(
+                    fx.Vector.from_elements(ht[4:], fx.Float32),
+                    ro,
+                    t * H + k0 + 4,
+                    D.CM_DEV,
+                )
     _rows_rstd(c, M, parts, red, 1)
+    D.probe(c, 7)
     cinv = fx.Float32(float(H) ** -0.5)
     for t in range_constexpr(M):
         rs = fx.ptr_load(red + (64 + 8 + t))
@@ -377,14 +445,129 @@ def prologue_router(c, g, xq, red, h, a, ssq_a, wpa, rscale, h1_out, rstd1_out):
             fx.ptr_store(
                 fx.Vector.from_elements(words, fx.Int32), xq + (t * g.XR + k0 * 2) // 4
             )
-    if (c["bid"] == 0) & (c["tid"] < M):
+    if const_expr(store):  # noqa: SIM102 (trace-time test, then a run-time one)
+        if (c["bid"] == 0) & (c["tid"] < M):
+            D.st(
+                fx.ptr_load(red + (64 + 8 + c["tid"])),
+                D.rsrc(rstd1_out),
+                c["tid"],
+                D.CM_DEV,
+            )
+    gpu.barrier()
+    D.probe(c, 8)
+
+
+@D.traced
+def _rstd_row(c, ssq, red, slot, m):
+    """red[64 + slot * 8] = rsqrt(sum(ssq[m, :]) / H + eps) (wave 0, the order of
+    rstd_from_ssq: the same bits as its row m)."""
+    r = D.rsrc(ssq)
+    lane = c["lane"]
+    ng = H // 16
+    if c["wave"] == 0:
+        s = fx.Float32(0.0)
+        for i in range_constexpr((ng + 63) // 64):
+            j = lane + 64 * i
+            v = D.ldf(r, m * ng + fx.min(j, ng - 1), cm=D.CM_DEV)
+            s = s + (j < ng).select(v, fx.Float32(0.0))
+        s = D.wave_sum(s)
+        if lane == 0:
+            fx.ptr_store(
+                D.rsq(s / fx.Float32(float(H)) + fx.Float32(EPS)), red + (64 + slot * 8)
+            )
+
+
+@D.traced
+def _quant8_g(c, x, rq, rsc, row, k0, live):
+    """store_quant8_at into global memory: 8 bytes at row * H + k0 of rq, the block's
+    scale at row * (H / 128) + k0 / 128 of rsc (the LDS image of the gate_up input)."""
+    lane = c["lane"]
+    am = fx.Float32(0.0)
+    for e in range_constexpr(8):
+        am = fx.max(am, D.absf(x[e]))
+    am = D.xor_max(am, lane, (1, 2, 4, 8))
+    qi, sc = D.pow2_scale(fx.max(am, fx.Float32(1e-30)))
+    lo, hi = D.quant8(x, qi)
+    if live:
         D.st(
-            fx.ptr_load(red + (64 + 8 + c["tid"])),
-            D.rsrc(rstd1_out),
-            c["tid"],
+            fx.Vector.from_elements([lo, hi], fx.Int32),
+            rq,
+            (row * H + k0) // 4,
             D.CM_DEV,
         )
+        if k0 % 128 == 0:
+            D.st(sc, rsc, row * (H // 128) + k0 // 128, D.CM_DEV)
+
+
+@D.traced
+def publish_row(c, M, m, red, h, a, ssq_a, wpa, w_e, w_d, h1_out, rstd1_out, xg, xgs):
+    """Router stage, CTA NR + m (docs/DESIGN.md "Optimization log"): row m's h1 = h +
+    rms(a) * post_attention_layernorm (the router prologue's arithmetic for that row) ->
+    h1_out, rstd(h1) -> rstd1_out, and the gate_up inputs quantized: row m of x_e =
+    rms(h1) * pre_feedforward_layernorm_2 and row M + m of x_d = rms(h1) *
+    pre_feedforward_layernorm -> xg (fp8 [2M][H]) and xgs (scales [2M][H / 128])."""
+    k0, live = _oct(c)
+    _rstd_row(c, ssq_a, red, 0, m)
+    rh, ra = D.rsrc(h), D.rsrc(a)
+    hv = _ld8(rh, m * H + k0)
+    av = _ld8(ra, m * H + k0)
+    wv = _w8(D.rsrc(wpa), k0)
+    we, wd = _w8(D.rsrc(w_e), k0), _w8(D.rsrc(w_d), k0)
     gpu.barrier()
+    rat = fx.ptr_load(red + 64)
+    ht = [hv[q] + av[q] * rat * wv[q] for q in range(8)]
+    ro = D.rsrc(h1_out)
+    if live:
+        D.st(fx.Vector.from_elements(ht[:4], fx.Float32), ro, m * H + k0, D.CM_DEV)
+        D.st(fx.Vector.from_elements(ht[4:], fx.Float32), ro, m * H + k0 + 4, D.CM_DEV)
+    _rows_rstd(c, 1, [_sq8(ht, live)], red, 1)
+    rs = fx.ptr_load(red + (64 + 8))
+    if c["tid"] == 0:
+        D.st(rs, D.rsrc(rstd1_out), m, D.CM_DEV)
+    n = [ht[q] * rs for q in range(8)]
+    rq, rsc = D.rsrc(xg), D.rsrc(xgs)
+    _quant8_g(c, [n[q] * we[q] for q in range(8)], rq, rsc, m, k0, live)
+    _quant8_g(c, [n[q] * wd[q] for q in range(8)], rq, rsc, M + m, k0, live)
+
+
+@D.traced
+def prologue_gu_copy(c, g, xq, xs, xg, xgs, rows=0):
+    """GEMV input published to global memory (publish_row: the gate_up input, 2M rows;
+    publish_qkv: the qkv input, M rows): copy the fp8 rows [rows][H] and their scales
+    into the LDS layout the GEMV reads (g.C == 1); the other scale rows are 0."""
+    M = g.M
+    assert g.Kc == H and g.slots == 1
+    rows = rows or 2 * M
+    tid = c["tid"]
+    _probe_on(c, g.name, 5)
+    nz = 32 * g.XSR
+    for i in range_constexpr((nz + NT - 1) // NT):
+        k = tid + NT * i
+        if k < nz:
+            fx.ptr_store(fx.Float32(0.0), xs + k)
+    gpu.barrier()
+    rq, rsc = D.rsrc(xg), D.rsrc(xgs)
+    per = H // 16  # 16-byte vectors per row
+    nv = rows * per
+    vals = []
+    for i in range_constexpr((nv + NT - 1) // NT):
+        k = fx.min(tid + NT * i, nv - 1)
+        vals.append(
+            (i, k, D.ld(rq, (k // per * H + k % per * 16) // 4, 4, cm=D.CM_DEV))
+        )
+    ns = rows * (H // 128)
+    svals = []
+    for i in range_constexpr((ns + NT - 1) // NT):
+        k = fx.min(tid + NT * i, ns - 1)
+        svals.append((i, k, D.ldf(rsc, k, cm=D.CM_DEV)))
+    for i, k, v in vals:
+        if tid + NT * i < nv:
+            fx.ptr_store(v, xq + (k // per * g.XR + k % per * 16) // 4)
+    for i, k, v in svals:
+        if tid + NT * i < ns:
+            fx.ptr_store(v, xs + (k // (H // 128) * g.XSR + k % (H // 128)))
+    gpu.barrier()
+    D.probe(c, 8)
 
 
 @D.traced
@@ -395,6 +578,7 @@ def prologue_gu(c, g, xq, xs, red, h1, rstd1, w_e, w_d):
     M = g.M
     tid = c["tid"]
     k0, live = _oct(c)
+    _probe_on(c, g.name, 5)
     nz = 32 * g.XSR
     for i in range_constexpr((nz + NT - 1) // NT):
         k = tid + NT * i
@@ -410,6 +594,7 @@ def prologue_gu(c, g, xq, xs, red, h1, rstd1, w_e, w_d):
         store_quant8(c, g, xq, xs, [n[q] * we[q] for q in range(8)], t, k0, live)
         store_quant8(c, g, xq, xs, [n[q] * wd[q] for q in range(8)], M + t, k0, live)
     gpu.barrier()
+    D.probe(c, 8)
 
 
 @D.traced

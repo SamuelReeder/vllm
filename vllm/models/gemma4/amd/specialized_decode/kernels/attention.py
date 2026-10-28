@@ -254,6 +254,8 @@ def _chunk(
     wl,
 ):
     lane = c["lane"]
+    D.PROBE["on"] = D.PROBE.get("stage") == "attn"  # bench/profile_decode.py PROBE=attn
+    D.probe(c, 4)
     HD, DL, NU, GQT, B = geo.HD, geo.DL, geo.NU, geo.GQT, geo.block
     s2, sv = geo.s2, geo.sv
     d0 = DL * lane
@@ -331,6 +333,7 @@ def _chunk(
             (so * s2 + sv + d0) // 2,
             D.CM_DEV,
         )
+    D.probe(c, 5)
     # ---- scores on the MFMA (bf16 16x16x16): tile [16 head rows][16 positions]; rows >= GQT
     # are zero. q goes to registers first: its LDS region then takes the scores.
     qa = []
@@ -348,6 +351,7 @@ def _chunk(
         kn_ = ktile(fx.min(t + 1, CH // 16 - 1))
         _score_tile(geo, wl, t, p0, pos, gq, nq, qa, kt, KN)
         kt = kn_
+    D.probe(c, 6)
     mx, sm = [], []
     for hh in range_constexpr(GQT):
         s_ = live.select(fx.ptr_load(wl + (hh * CH + lane)), fx.Float32(NEG))
@@ -356,12 +360,14 @@ def _chunk(
         mx.append(mh)
         sm.append(D.xor_sum(ph, lane, (1, 2, 4, 8, 16, 32)))
         fx.ptr_store(ph, wl + (hh * CH + lane))
-    # ---- P V: lane -> dims d0 .. d0 + DL - 1
+    # ---- P V: lane -> dims d0 .. d0 + DL - 1. Loading batch b + 1 during batch b was
+    # slower (bench/results/m4/attn_vpipe*.txt; cause not measured, likely VGPR pressure)
     acc = [[fx.Float32(0.0)] * DL for _ in range(GQT)]
     vl_ = _lds_ld_i32(wl, VN + d0 // 2, DL // 2)
     for b in range(0, D.opaque_s(CH // PVB)):
         vrs = vload(b)
         acc = _pv_batch(geo, wl, b, p0, pos, vl_, vrs, acc)
+    D.probe(c, 7)
     # ---- partial record
     rr = D.rsrc(rec)
     cidx = (m * geo.NKV + j) * geo.NG + g
@@ -384,11 +390,13 @@ def _chunk(
     if lane == 0:
         old = D.atomic_add_dev(cnt + cidx * 4, 1)
     old = D.uniform(old)
+    D.probe(c, 8)
     if old + 1 == nchunk:
         # every other arrival is in; the counter's next use is behind a grid barrier
         if lane == 0:
             D.st(fx.Int32(0), D.rsrc(cnt), cidx, D.CM_DEV)
         _merge(geo, lane, m, j, g, cidx, nchunk, rr, o)
+        D.probe(c, 9)
 
 
 @D.traced

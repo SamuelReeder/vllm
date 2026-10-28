@@ -37,7 +37,7 @@ from dataclasses import asdict, dataclass
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr
+from flydsl.expr import const_expr, gpu
 from flydsl.expr.typing import Int32, Int64
 
 from . import attention as A
@@ -62,7 +62,7 @@ from .dims import (
 from .gemv import Gemv
 
 NTAB = 24  # pointer-table slots per row
-NGLOB = 28  # global pointer-table slots
+NGLOB = 32  # global pointer-table slots
 WAVES = 8
 NT = 64 * WAVES
 LDS_MAX = 65536
@@ -97,6 +97,10 @@ LDS_MAX = 65536
     G_ROWV,
     G_SPARE,
     G_SPARE2,
+    G_XG,
+    G_XGS,
+    G_XQ,
+    G_XQS,
 ) = range(NGLOB)
 # per-row slots (row i + 1 = layer i)
 (
@@ -154,6 +158,15 @@ class Cfg:
     c_e1: int = 11  # 2816 = 11 x 256: 2 units per piece
     c_e2: int = 2  # 768 = 2 x 384: 3 units per piece
     c_lm: int = 1
+    # router stage: only the CTAs with router units run its prologue; CTAs NR .. NR + M - 1
+    # publish h1 and the quantized gate_up inputs (stages.publish_row), which the gate_up
+    # prologue copies; else every CTA runs both whole-row prologues
+    router_publish: bool = True
+    # down stage: CTAs cus - M + m wait for all expert-down groups (a device counter), then
+    # rebuild row m of h and publish the next layer's quantized qkv input
+    # (stages.combine_row), which the qkv prologue copies (layers > 0); else every CTA
+    # rebuilds all rows of h in the qkv prologue
+    combine_rows: bool = True
     debug_route: bool = False  # store a hash of every CTA's routing tables (I5)
     fence: bool = False  # L2 write-back / invalidate at every grid barrier (dev.grid_*)
 
@@ -189,7 +202,7 @@ class Cfg:
         return max(s.part_floats() for s in self.specs().values())
 
 
-CNT_REGION = dict(qkv=0, o=1, router=2, e1=3, e2=4, lm=5, attn=6)
+CNT_REGION = dict(qkv=0, o=1, router=2, e1=3, e2=4, lm=5, attn=6, done=7)
 
 
 PROFILE = {
@@ -371,11 +384,13 @@ def build(cfg: Cfg):
             e0 = epoch + 1 + i * STAGES_PER_LAYER
             T = functools.partial(lambda r, k: tab64(rt, r + k), (i + 1) * NTAB)
             Tp = functools.partial(lambda r, k: tab64(rt, r + k), i * NTAB)
+            Tn = functools.partial(lambda r, k: tab64(rt, r + k), (i + 2) * NTAB)
             env = dict(
                 c=c,
                 SP=SP,
                 T=T,
                 Tp=Tp,
+                Tn=Tn,
                 G=G,
                 e0=e0,
                 xq=xq,
@@ -393,7 +408,7 @@ def build(cfg: Cfg):
                 _attn_layer(env, GEO[True], "f")
             else:
                 _attn_layer(env, GEO[False], "s")
-            _moe(env, R)
+            _moe(env, R, nlayers)
         c.clear()
         c.update(c0)
         e_end = epoch + 1 + nlayers * STAGES_PER_LAYER
@@ -452,8 +467,8 @@ def _attn_layer(env, geo, kind):
     _attn_layer_t(**env, geo=geo, kind=kind)
 
 
-def _moe(env, R):
-    _moe_t(**env, R=R)
+def _moe(env, R, nlayers):
+    _moe_t(**env, R=R, nlayers=nlayers)
 
 
 @D.traced
@@ -462,6 +477,7 @@ def _attn_layer_t(
     SP,
     T,
     Tp,
+    Tn,
     G,
     e0,
     xq,
@@ -482,22 +498,16 @@ def _attn_layer_t(
     rope = G[G_ROPE_F] if geo.full else G[G_ROPE_S]
     # qkv: rebuild h (the previous layer's raw outputs), input_layernorm, fp8
     w, buf = barrier_then(qkv, T(T_QKV_T), T(T_QKV_S), e0)
-    hh, k0, live = S.rebuild_h(
-        c,
-        M,
-        red,
-        G[G_H1],
-        G[G_D],
-        G[G_E],
-        G[G_SSQD],
-        G[G_SSQE],
-        Tp(T_POST1),
-        Tp(T_POST2),
-        Tp(T_POSTF),
-        Tp(T_LS),
-        G[G_H],
-    )
-    S.prologue_qkv(c, qkv, xq, xs, red, hh, k0, live, T(T_IN_LN))
+    if const_expr(cfg.combine_rows):
+        if (c["bid"] == 0) & (c["tid"] == 0):
+            # the previous layer's combine CTAs have passed the done counter
+            D.st(fx.Int32(0), D.rsrc(cnt("done")), 0, D.CM_DEV)
+        if li == 0:
+            _qkv_rebuild(c, M, qkv, xq, xs, red, G, T, Tp)
+        else:  # the previous layer's combine CTAs published x (and h)
+            S.prologue_gu_copy(c, qkv, xq, xs, G[G_XQ], G[G_XQS], M)
+    else:
+        _qkv_rebuild(c, M, qkv, xq, xs, red, G, T, Tp)
     qkv.run(
         c,
         w,
@@ -534,8 +544,47 @@ def _attn_layer_t(
 
 
 @D.traced
+def _qkv_rebuild(c, M, qkv, xq, xs, red, G, T, Tp):
+    hh, k0, live = S.rebuild_h(
+        c,
+        M,
+        red,
+        G[G_H1],
+        G[G_D],
+        G[G_E],
+        G[G_SSQD],
+        G[G_SSQE],
+        Tp(T_POST1),
+        Tp(T_POST2),
+        Tp(T_POSTF),
+        Tp(T_LS),
+        G[G_H],
+        qkv.name,
+    )
+    S.prologue_qkv(c, qkv, xq, xs, red, hh, k0, live, T(T_IN_LN))
+
+
+@D.traced
 def _moe_t(
-    c, SP, T, Tp, G, e0, xq, xs, red, wl, part, cnt, barrier_then, gw, cfg, li, R
+    c,
+    SP,
+    T,
+    Tp,
+    Tn,
+    G,
+    e0,
+    xq,
+    xs,
+    red,
+    wl,
+    part,
+    cnt,
+    barrier_then,
+    gw,
+    cfg,
+    li,
+    R,
+    nlayers,
 ):
     rtr, e1, e2 = SP["router"], SP["e1"], SP["e2"]
     M = rtr.M
@@ -545,19 +594,56 @@ def _moe_t(
         logit = logit + fx.Int64(li) * (M * MO.LGN * 4)
     # router: h1 = h + post_attention_layernorm(a); x = bf16(router norm)
     w, buf = barrier_then(rtr, T(T_RT), T(T_RT), e0 + 3)
-    S.prologue_router(
-        c,
-        rtr,
-        xq,
-        red,
-        G[G_H],
-        G[G_A],
-        G[G_SSQA],
-        T(T_PA_LN),
-        T(T_RSCALE),
-        G[G_H1],
-        G[G_RSTD1],
-    )
+    if const_expr(cfg.router_publish):
+        NR = -(-min(rtr.U, rtr.NW) // WAVES)  # CTAs with router units (a "small" GEMV)
+        assert rtr.small and cfg.cus >= NR + M
+        bid = c["bid"]
+        if bid < NR:
+            S.prologue_router(
+                c,
+                rtr,
+                xq,
+                red,
+                G[G_H],
+                G[G_A],
+                G[G_SSQA],
+                T(T_PA_LN),
+                T(T_RSCALE),
+                G[G_H1],
+                G[G_RSTD1],
+                store=False,
+            )
+        elif bid < NR + M:
+            S.publish_row(
+                c,
+                M,
+                bid - NR,
+                red,
+                G[G_H],
+                G[G_A],
+                G[G_SSQA],
+                T(T_PA_LN),
+                T(T_PF2_LN),
+                T(T_PF_LN),
+                G[G_H1],
+                G[G_RSTD1],
+                G[G_XG],
+                G[G_XGS],
+            )
+    else:
+        S.prologue_router(
+            c,
+            rtr,
+            xq,
+            red,
+            G[G_H],
+            G[G_A],
+            G[G_SSQA],
+            T(T_PA_LN),
+            T(T_RSCALE),
+            G[G_H1],
+            G[G_RSTD1],
+        )
     rtr.run(
         c,
         w,
@@ -571,7 +657,10 @@ def _moe_t(
     MO.routing(c, M, logit, G[G_ROWV], T(T_PES), R)
     if const_expr(cfg.debug_route):
         MO.route_hash(c, M, R, G[G_SPARE], li, c["cus"], NL)
-    S.prologue_gu(c, e1, xq, xs, red, G[G_H1], G[G_RSTD1], T(T_PF2_LN), T(T_PF_LN))
+    if const_expr(cfg.router_publish):
+        S.prologue_gu_copy(c, e1, xq, xs, G[G_XG], G[G_XGS])
+    else:
+        S.prologue_gu(c, e1, xq, xs, red, G[G_H1], G[G_RSTD1], T(T_PF2_LN), T(T_PF_LN))
     w1 = e1.setup(c, xq, xs, T(T_E1_T), T(T_E1_S))
     e1.run(c, w1, R, part, cnt("e1"), MO.EpiAct(c, M, R, G[G_ACT], EFFP))
     # down: weighted expert sum e and dense sum d, raw, with their sums of squares
@@ -579,12 +668,47 @@ def _moe_t(
     pos0 = e2.cta_pos0(c["bid"], R.n())
     MO.prologue_act_moe(c, e2, xq, xs, G[G_ACT], R, pos0)
     w2 = e2.setup(c, xq, xs, T(T_E2_T), T(T_E2_S))
-    e2.run(
-        c,
-        w2,
-        R,
-        part,
-        cnt("e2"),
-        S.EpiDE(c, M, G[G_E], G[G_SSQE], G[G_D], G[G_SSQD]),
-        pos0,
-    )
+    if const_expr(cfg.combine_rows):
+        more = li + 1 < nlayers  # the last layer's h is rebuilt by the final stage
+        e2.run(
+            c,
+            w2,
+            R,
+            part,
+            cnt("e2"),
+            S.EpiDE(c, M, G[G_E], G[G_SSQE], G[G_D], G[G_SSQD], cnt("done"), more),
+            pos0,
+        )
+        m = c["bid"] - (cfg.cus - M)
+        if more & (m >= 0):
+            if c["tid"] == 0:
+                D.poll_ge(D.rsrc(cnt("done")), 0, fx.Int32(e2.G))
+            gpu.barrier()  # every expert-down group has stored d, e and their sums
+            S.combine_row(
+                c,
+                m,
+                red,
+                G[G_H1],
+                G[G_D],
+                G[G_E],
+                G[G_SSQD],
+                G[G_SSQE],
+                T(T_POST1),
+                T(T_POST2),
+                T(T_POSTF),
+                T(T_LS),
+                Tn(T_IN_LN),
+                G[G_H],
+                G[G_XQ],
+                G[G_XQS],
+            )
+    else:
+        e2.run(
+            c,
+            w2,
+            R,
+            part,
+            cnt("e2"),
+            S.EpiDE(c, M, G[G_E], G[G_SSQE], G[G_D], G[G_SSQD]),
+            pos0,
+        )

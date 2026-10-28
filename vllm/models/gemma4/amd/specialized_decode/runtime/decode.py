@@ -99,6 +99,12 @@ class Gemma4Gfx942Decode:
         self.router = z(1, Mx, MO.LGN)
         self.act = z(Mx, MO.NSLOT, EFFP)  # columns EFF.. stay 0 (the padded down K)
         self.rowv = z(Mx, dt=torch.int32)
+        # router_publish: the gate_up inputs, fp8 [2M][H] and scales [2M][H / 128];
+        # combine_rows: the next layer's qkv input, fp8 [M][H] and scales [M][H / 128]
+        self.xg = z(2 * Mx * H // 4, dt=torch.int32)
+        self.xgs = z(2 * Mx * (H // 128))
+        self.xq = z(Mx * H // 4, dt=torch.int32)
+        self.xqs = z(Mx * (H // 128))
         self.cnt = z(len(KK.CNT_REGION) * KK.CNT_STRIDE, dt=torch.int32)
         self.flags = z((self.cus + KK.EPOCH_WORD_LINE + 1) * 32, dt=torch.int32)
         self.tok = z(Mx, dt=torch.int32)
@@ -212,6 +218,10 @@ class Gemma4Gfx942Decode:
         g[KK.G_LOGIT] = self.router.data_ptr()
         g[KK.G_ACT] = self.act.data_ptr()
         g[KK.G_ROWV] = self.rowv.data_ptr()
+        g[KK.G_XG] = self.xg.data_ptr()
+        g[KK.G_XGS] = self.xgs.data_ptr()
+        g[KK.G_XQ] = self.xq.data_ptr()
+        g[KK.G_XQS] = self.xqs.data_ptr()
         self.glob = torch.tensor(g, dtype=torch.int64, device=self.device)
         tab = torch.zeros(NL + 1, KK.NTAB, dtype=torch.int64)
         # row 0, "layer -1": ones as its post-feedforward norms, layer scalar 1.0
