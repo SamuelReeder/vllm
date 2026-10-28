@@ -79,14 +79,6 @@ def opaque_s(v):
     )
 
 
-def opaque64(v):
-    """Wave-uniform i64 version of opaque_s (two s_mov)."""
-    v = fx.Int64(v)
-    hi = opaque_s(fx.Int32(v >> 32))
-    lo = opaque_s(fx.Int32(v & 0xFFFFFFFF))
-    return (fx.Int64(hi) << 32) | fx.Int64(fx.Uint32(lo))
-
-
 def opaque_v(v):
     """Per-lane i32 version of opaque_s (v_mov)."""
     return fx.Int32(

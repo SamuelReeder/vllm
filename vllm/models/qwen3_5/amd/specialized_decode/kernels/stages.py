@@ -151,8 +151,9 @@ class EpiRes:
     pre(grp) loads h_in; the GEMV issues it with its partial loads.
 
     TP > 1 (c["ar"] set): tot is this rank's partial; ar = (tag, half) of this
-    all-reduce, and tot becomes the ranks' partials summed in rank order
-    (all_reduce)."""
+    all-reduce. The GEMV calls push(grp, tots) for every group it completes, then
+    finish(grp): tot becomes the ranks' partials summed in rank order (ar_push,
+    ar_poll; docs/DESIGN-TP2.md sections 5, 6, 11)."""
 
     def __init__(self, c, M, h_in, h_out, ssq_out, hb_out, ar=None):
         self.c, self.M, self.h_in, self.h_out, self.ssq_out, self.hb_out = (
@@ -164,10 +165,9 @@ class EpiRes:
             hb_out,
         )
         self.ar = ar if D.TRACE["ar"] is not None else None
-        # deferred poll (Cfg.ar_defer): the GEMV pushes every group it completes first
-        # (push), then polls and stores them (finish), so the round trips overlap
-        A = D.TRACE["ar"]
-        self.deferred = self.ar is not None and A["defer"] and not A["local"]
+        # deferred poll: the GEMV pushes every group it completes first (push), then
+        # polls and stores them (finish), so the round trips of a wave's groups overlap
+        self.deferred = self.ar is not None and not D.TRACE["ar"]["local"]
 
     def pre(self, grp):
         ri = D.rsrc(self.h_in)
@@ -182,8 +182,8 @@ class EpiRes:
 
     def __call__(self, grp, tots, pre):
         tot = tots[0]
-        if const_expr(self.ar is not None):
-            tot = all_reduce(self.c, self.M, grp, tot, *self.ar)
+        if const_expr(self.ar is not None):  # ar_local only (deferred otherwise)
+            tot = ar_local(self.c, self.M, grp, tot, *self.ar)
         _epi_res(self.c, self.M, grp, tot, pre, self.h_out, self.ssq_out, self.hb_out)
 
     def push(self, grp, tots):
@@ -195,24 +195,11 @@ class EpiRes:
         _epi_res(self.c, self.M, grp, tot, pre, self.h_out, self.ssq_out, self.hb_out)
 
 
-_AR_OPAQUE = __import__("os").environ.get("MK_AR_OPAQUE", "0") == "1"  # MEASURE-ONLY
-
-
-def _peer_bases(A):
-    """The peer bases and the own base; MK_AR_OPAQUE=1 (measure-only candidate) passes
-    them through opaque moves, so the peer address math stays inside the epilogue
-    instead of being hoisted out of the layer loop (SGPR pressure)."""
-    if _AR_OPAQUE:
-        return [D.opaque64(b) for b in A["bases"]], D.opaque64(A["own"])
-    return A["bases"], A["own"]
-
-
 def _ar_ctx(c, grp, tag, half):
     A = dict(D.TRACE["ar"], **c["ar"])
     off = fx.Int64(half * A["region"])
-    bases, own_b = _peer_bases(A)
-    dst = [preg(bases[p] + off, 0, "ar") for p in range(A["tp"])]
-    own = preg(own_b + off, 0, "ar")
+    dst = [preg(A["bases"][p] + off, 0, "ar") for p in range(A["tp"])]
+    own = preg(A["own"] + off, 0, "ar")
     rows = [4 * c["gl"] + r for r in range(4)]
     k = ((fx.Int32(tag) - A["epoch"] - 1) * c["cus"] * 8 + c["bid"] * 8 + c["wave"]) * 4
     return A, dst, own, rows, grp * 16 + c["col"], k
@@ -220,7 +207,9 @@ def _ar_ctx(c, grp, tag, half):
 
 @D.traced
 def ar_push(c, M, grp, tot, tag, half):
-    """The push half of all_reduce (deferred poll): this rank's partial to every rank."""
+    """This rank's partial tot[r] (row 4 gl + r, column 16 grp + col) to region `half`
+    of every rank's peer buffer, its own included: [src rank][M][H] (value, tag) pairs
+    ("fp32") or [src][M][H / 2] (bf16 pair, tag) words ("bf16")."""
     A, dst, own, rows, n, k = _ar_ctx(c, grp, tag, half)
     tp, rank, lane, col = A["tp"], A["rank"], c["lane"], c["col"]
     tv = [fx.Float32(tot[r]) for r in range(4)]
@@ -229,10 +218,17 @@ def ar_push(c, M, grp, tot, tag, half):
     if const_expr(apw is not None):
         t_push = D.memrealtime()
     if const_expr(A["dtype"] == "fp32"):
+        # 16-byte pushes: the even lane stores its pair and its odd neighbour's
+        even = col % 2 == 0
         for r in range_constexpr(4):
-            if rows[r] < M:
+            nb = D.gather_f(tv[r], lane ^ 1)
+            if (rows[r] < M) & even:
                 for p in range_constexpr(tp):
-                    Mailbox(tag).put(dst[p], (rank * M + rows[r]) * H + n, tv[r])
+                    Mailbox(tag).put_words(
+                        dst[p],
+                        (rank * M + rows[r]) * H + n,
+                        [tv[r].bitcast(fx.Int32), fx.Float32(nb).bitcast(fx.Int32)],
+                    )
     else:
         even = col % 2 == 0
         for r in range_constexpr(4):
@@ -245,35 +241,47 @@ def ar_push(c, M, grp, tot, tag, half):
                         [tv[r], nb],
                     )
     if const_expr(apw is not None):
-        if lane == 0:
-            D.st_stamps(fx.Int64(apw), k, t_push, t_push)
+        _stamps(apw, lane, [(k, t_push, t_push)])
 
 
 @D.traced
 def ar_poll(c, M, grp, tag, half):
-    """The poll half of all_reduce (deferred poll): every rank's partial from the own
-    region (the own one included, pushed by ar_push), summed in rank order."""
+    """Every rank's partial from the own region (the own one included, pushed by
+    ar_push), summed in rank order: every rank adds the same bits in the same order,
+    so all ranks agree."""
     A, dst, own, rows, n, k = _ar_ctx(c, grp, tag, half)
     tp, lane, col = A["tp"], c["lane"], c["col"]
     mb = Mailbox(fx.Int32(tag))
     apw = D.ARPROBE["wave"]
     fp = A["dtype"] == "fp32"
     W = H if fp else H // 2
-    specs = [
-        (own, (s * M + fx.min(rows[r], M - 1)) * W + (n if fp else n // 2), 1)
-        for r in range(4)
-        for s in range(tp)
-    ]
+    even = col % 2 == 0
+    if const_expr(fp):  # the even column's 16-byte pair of pairs
+        specs = [
+            (own, (s * M + fx.min(rows[r], M - 1)) * W + n - col % 2, 2)
+            for r in range(4)
+            for s in range(tp)
+        ]
+    else:
+        specs = [
+            (own, (s * M + fx.min(rows[r], M - 1)) * W + (n if fp else n // 2), 1)
+            for r in range(4)
+            for s in range(tp)
+        ]
     if const_expr(apw is not None):
         t_ps = D.memrealtime()
     ws = mb.poll(specs)
     if const_expr(apw is not None):
         t_pe = D.memrealtime()
     out = []
-    even = col % 2 == 0
     for r in range_constexpr(4):
         if const_expr(fp):
-            vals = [fx.Int32(ws[r * tp + s][0]).bitcast(fx.Float32) for s in range(tp)]
+            vals = [
+                fx.Int32(even.select(ws[r * tp + s][0], ws[r * tp + s][1])).bitcast(
+                    fx.Float32
+                )
+                for s in range(tp)
+            ]
         else:
             vals = [
                 even.select(D.bf_lo(ws[r * tp + s][0]), D.bf_hi(ws[r * tp + s][0]))
@@ -284,97 +292,33 @@ def ar_poll(c, M, grp, tag, half):
             a = a + vals[s]
         out.append(a)
     if const_expr(apw is not None):
-        if lane == 0:
-            D.st_stamps(fx.Int64(apw), k + 1, t_ps, t_pe)
-            D.st_stamps(fx.Int64(apw), k + 2, t_pe, fx.Int64(grp))
+        _stamps(apw, lane, [(k + 1, t_ps, t_pe), (k + 2, t_pe, fx.Int64(grp))])
     return fx.Vector.from_elements(out, fx.Float32)
 
 
 @D.traced
-def all_reduce(c, M, grp, tot, tag, half):
-    """The TP all-reduce of a residual epilogue (docs/DESIGN-TP2.md sections 5, 6): this
-    rank's partial tot[r] (row 4 gl + r, column 16 grp + col) to region `half` of every
-    rank's peer buffer, [src rank][M][H] (value, tag) pairs ("fp32") or [src][M][H / 2]
-    (bf16 pair, tag) words ("bf16"); then the own region's sources summed in rank
-    order. Every rank adds the same bits in the same order, so all ranks agree."""
-    A = dict(D.TRACE["ar"], **c["ar"])
-    tp, rank, lane, col = A["tp"], A["rank"], c["lane"], c["col"]
-    n = grp * 16 + col
-    rows = [4 * c["gl"] + r for r in range(4)]
-    tv = [fx.Float32(tot[r]) for r in range(4)]
-    tag = fx.Int32(tag)
-    mb = Mailbox(tag)
-    off = fx.Int64(half * A["region"])
-    bases, own_b = _peer_bases(A)
-    dst = [preg(bases[p] + off, 0, "ar") for p in range(tp)]
-    own = preg(own_b + off, 0, "ar")
-    out = []
+def _stamps(apw, lane, pairs):
+    """Debug (dev.ARPROBE): lane 0 stores the i64 pairs (index, a, b) of a wave."""
+    if lane == 0:
+        for i, a, b in pairs:
+            D.st_stamps(fx.Int64(apw), i, a, b)
+
+
+@D.traced
+def ar_local(c, M, grp, tot, tag, half):
+    """Timing-only stand-in of the all-reduce (Cfg.ar_local): the own partial added
+    twice, no peer traffic, the same probe stamps as ar_push / ar_poll."""
+    A, _, _, _, _, k = _ar_ctx(c, grp, tag, half)
     apw = D.ARPROBE["wave"]
     if const_expr(apw is not None):
         t_push = D.memrealtime()
-    if const_expr(A["local"]):  # timing only: no peer traffic
-        for r in range_constexpr(4):
-            v = D.bf16r(tv[r]) if A["dtype"] == "bf16" else tv[r]
-            out.append(v + v)
-        if const_expr(apw is not None):
-            t_ps = D.memrealtime()
-            t_pe = t_ps
-    elif const_expr(A["dtype"] == "fp32"):
-        for r in range_constexpr(4):
-            if rows[r] < M:
-                for p in range_constexpr(tp):
-                    Mailbox(tag).put(dst[p], (rank * M + rows[r]) * H + n, tv[r])
-        specs = [
-            (own, (s * M + fx.min(rows[r], M - 1)) * H + n, 1)
-            for r in range(4)
-            for s in range(tp)
-        ]
-        if const_expr(apw is not None):
-            t_ps = D.memrealtime()
-        ws = mb.poll(specs)
-        if const_expr(apw is not None):
-            t_pe = D.memrealtime()
-        for r in range_constexpr(4):
-            a = fx.Int32(ws[r * tp][0]).bitcast(fx.Float32)
-            for s in range_constexpr(1, tp):
-                a = a + fx.Int32(ws[r * tp + s][0]).bitcast(fx.Float32)
-            out.append(a)
-    else:
-        # columns 2 i, 2 i + 1 share a word: the even lane stores the pair
-        even = col % 2 == 0
-        for r in range_constexpr(4):
-            nb = D.gather_f(tv[r], lane ^ 1)
-            if (rows[r] < M) & even:
-                for p in range_constexpr(tp):
-                    Mailbox(tag).put_bf(
-                        dst[p],
-                        2 * ((rank * M + rows[r]) * (H // 2) + n // 2),
-                        [tv[r], nb],
-                    )
-        specs = [
-            (own, (s * M + fx.min(rows[r], M - 1)) * (H // 2) + n // 2, 1)
-            for r in range(4)
-            for s in range(tp)
-        ]
-        if const_expr(apw is not None):
-            t_ps = D.memrealtime()
-        ws = mb.poll(specs)
-        if const_expr(apw is not None):
-            t_pe = D.memrealtime()
-        for r in range_constexpr(4):
-            vals = [
-                even.select(D.bf_lo(ws[r * tp + s][0]), D.bf_hi(ws[r * tp + s][0]))
-                for s in range(tp)
-            ]
-            a = vals[0]
-            for s in range_constexpr(1, tp):
-                a = a + vals[s]
-            out.append(a)
+    out = []
+    for r in range_constexpr(4):
+        v = D.bf16r(tot[r]) if A["dtype"] == "bf16" else fx.Float32(tot[r])
+        out.append(v + v)
     if const_expr(apw is not None):
-        k = ((tag - A["epoch"] - 1) * c["cus"] * 8 + c["bid"] * 8 + c["wave"]) * 4
-        if lane == 0:
-            D.st_stamps(fx.Int64(apw), k, t_push, t_ps)
-            D.st_stamps(fx.Int64(apw), k + 2, t_pe, fx.Int64(grp))
+        t_ps = D.memrealtime()
+        _stamps(apw, c["lane"], [(k, t_push, t_ps), (k + 2, t_ps, fx.Int64(grp))])
     return fx.Vector.from_elements(out, fx.Float32)
 
 
@@ -611,9 +555,10 @@ def embed_stage(c, M, tok_ptr, emb, h_out, ssq_out, hb_out, tag):
             k = gi * 16 + col
             w = D.ld(re, k // 2)
             v = (k % 2 == 0).select(D.bf_lo(w), D.bf_hi(w))
-            # ar_local (timing only) skips the exchange too: with no peer traffic in the
-            # layers, the ranks do not keep in step, and the one embedding region would
-            # be overwritten before it is read. The non-owner rank then reads a wrong row.
+            # ar_local (timing only) skips the exchange too: with no peer traffic in
+            # the layers, the ranks do not keep in step, and the one embedding region
+            # would be overwritten before it is read. The non-owner rank then reads a
+            # wrong row.
             if const_expr(D.TRACE["ar"] is not None and not D.TRACE["ar"]["local"]):
                 v = _embed_exchange(c, M, tag, owner, t, k, v)
             D.st(v, ro, t * H + k, D.CM_DEV)
