@@ -61,6 +61,7 @@ from .dims import (
 )
 from .mkcore import dev as D
 from .mkcore import key as K
+from .mkcore import stagelib as SL
 from .mkcore.dev import (
     _STREAM,
     CNT_STRIDE,
@@ -564,7 +565,7 @@ def _attn_layer_t(
         buf,
         part,
         cnt("qkv"),
-        lambda cg, tots: S.epi_raw(c, M, qkv.N, cg, tots[0], G[G_Y]),
+        lambda cg, tots: SL.epi_raw(c, M, qkv.N, cg, tots[0], G[G_Y]),
     )
     # attention tasks
     barrier_then(None, None, None, e0 + 1)
@@ -702,7 +703,7 @@ def _moe_t(
         buf,
         part,
         cnt("router"),
-        lambda cg, tots: S.epi_raw(c, M, MO.LGN, cg, tots[0], logit),
+        lambda cg, tots: SL.epi_raw(c, M, MO.LGN, cg, tots[0], logit),
     )
     # routing (every CTA), then gate_up of the routed experts and the dense MLP
     barrier_then(None, None, None, e0 + 4)

@@ -3,10 +3,10 @@
 # ruff: noqa: E501
 """Stage prologues (fill the GEMV's LDS x) and last-arriver epilogues.
 
-zero_xs_tail, store_quant8(_at), epi_raw, prologue_scaled and the rstd reduction are
-copied from qwen3.6-35b-a3b-gfx942/mk/stages.py at megakernels e2a6fb8 (copy and
-diverge, docs/DESIGN.md D2). The rest is Gemma 4 (docs/DESIGN.md "Stages"): every
-norm after a projection needs the projection's whole row, so a consumer rebuilds the
+prologue_scaled and the rstd reduction are copied from qwen3.6-35b-a3b-gfx942/mk/stages.py
+at megakernels e2a6fb8 (copy and diverge, docs/DESIGN.md D2); the shared helpers are in
+common/mkcore/stagelib.py. The rest is Gemma 4 (docs/DESIGN.md "Stages"): every norm
+after a projection needs the projection's whole row, so a consumer rebuilds the
 residual from raw stage outputs ("deferred residual"):
 
   h1 = h + post_attention_layernorm(a)                       (router prologue)
@@ -34,54 +34,11 @@ from flydsl.expr.typing import T
 
 from .dims import EPS, VOCAB, H
 from .mkcore import dev as D
+from .mkcore.stagelib import store_quant8, zero_xs_tail
 
 NT = 512  # threads per CTA (set by the kernel builder before tracing)
 NOCT = H // 8  # threads that hold a row's columns (352)
 RED_FLOATS = 8 * 8 + 32  # LDS floats of `red`: [8 waves][8 rows] partials, then rstds
-
-
-@D.traced
-def zero_xs_tail(c, g, xs):
-    """x-scale rows of tokens M..15 = 0: their MFMA rows contribute nothing."""
-    n = (16 - g.M) * g.XSR
-    for i in range_constexpr((n + NT - 1) // NT):
-        j = c["tid"] + NT * i
-        if j < n:
-            fx.ptr_store(fx.Float32(0.0), xs + (g.M * g.XSR + j))
-
-
-def store_quant8(c, g, xq, xs, x, t, k0, live):
-    """8 values of token t at column k0 (16 consecutive lanes = one 128 block) ->
-    LDS fp8 + the block's pow2 scale."""
-    store_quant8_at(c, xq, xs, x, t, g.XR, g.XSR, k0, live)
-
-
-@D.traced
-def store_quant8_at(c, xq, xs, x, row, xr, xsr, k0, live):
-    """store_quant8 into LDS row `row` of xr bytes (xsr scales per row)."""
-    lane = c["lane"]
-    am = fx.Float32(0.0)
-    for e in range_constexpr(8):
-        am = fx.max(am, D.absf(x[e]))
-    am = D.xor_max(am, lane, (1, 2, 4, 8))
-    qi, sc = D.pow2_scale(fx.max(am, fx.Float32(1e-30)))
-    lo, hi = D.quant8(x, qi)
-    if live:
-        fx.ptr_store(
-            fx.Vector.from_elements([lo, hi], fx.Int32), xq + (row * xr + k0) // 4
-        )
-        if k0 % 128 == 0:
-            fx.ptr_store(sc, xs + (row * xsr + k0 // 128))
-
-
-@D.traced
-def epi_raw(c, M, N, grp, tot, out, off=0):
-    """out[:, off + 16 grp + col] = tot (fp32 [M][N])."""
-    ro = D.rsrc(out)
-    for r in range_constexpr(4):
-        t = 4 * c["gl"] + r
-        if t < M:
-            D.st(tot[r], ro, t * N + off + grp * 16 + c["col"], D.CM_DEV)
 
 
 @D.traced

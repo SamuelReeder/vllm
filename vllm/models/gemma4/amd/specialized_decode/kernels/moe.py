@@ -51,6 +51,7 @@ from flydsl.expr.typing import T
 from . import stages as S
 from .dims import NDS, NE, TOPK
 from .mkcore import dev as D
+from .mkcore import stagelib as SL
 from .mkcore.gemv import fp8_row_compute, fp8_row_load
 
 LGN = NE  # router GEMV rows
@@ -778,7 +779,7 @@ def prologue_act_moe(c, g, xq, xs, act, R, pos0):
         )
     for i, sl, m, kc, v in raw:
         x = [v[0][0], v[0][1], v[0][2], v[0][3], v[1][0], v[1][1], v[1][2], v[1][3]]
-        S.store_quant8_at(
+        SL.store_quant8_at(
             c, xq, xs, x, sl * 16 + m, g.XR, g.XSR, kc, tid + NT * i < nch
         )
     gpu.barrier()
