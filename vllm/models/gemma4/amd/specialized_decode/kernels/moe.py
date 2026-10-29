@@ -48,10 +48,10 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from . import dev as D
 from . import stages as S
 from .dims import NDS, NE, TOPK
-from .gemv import fp8_compute, fp8_load
+from .mkcore import dev as D
+from .mkcore.gemv import fp8_row_compute, fp8_row_load
 
 LGN = NE  # router GEMV rows
 NSLOT = TOPK + NDS  # 8 routed slots + the dense pseudo-experts
@@ -271,7 +271,7 @@ class MoeGemv:
     # per-group last arriver)
     rows: bool = False
 
-    kind = "fp8"
+    kind = "fp8_row"
     esize = 1
     slots = 1  # (prologue_norm interface: all K in LDS)
 
@@ -376,7 +376,9 @@ class MoeGemv:
 
     def _load_piece(self, w, R, pi):
         ub = self._ubase(R, pi)
-        return [fp8_load(w["rt"], w["rs"], ub + s, w["lane"]) for s in range(self.KSp)]
+        return [
+            fp8_row_load(w["rt"], w["rs"], ub + s, w["lane"]) for s in range(self.KSp)
+        ]
 
     @D.traced
     def run(self, c, w, R, part, cnt, fin, pos0=None):
@@ -414,7 +416,9 @@ class MoeGemv:
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for s in range_constexpr(KSp):
                 xo = ch * KSp + s
-                acc = acc + fp8_compute(w, arow + xo * 128, xof + xo, self.XSR, buf[s])
+                acc = acc + fp8_row_compute(
+                    w, arow + xo * 128, xof + xo, self.XSR, buf[s]
+                )
             if const_expr(self.mode == "gu"):
                 if w["gl"] < self.MT:
                     D.st(acc, rp, (pi * 64 + w["lane"]) * 4, D.CM_DEV)
@@ -465,7 +469,9 @@ class MoeGemv:
             R.eid_of(gid // self.G) * self.upe
             + ((q % self.C) * self.G + gid % self.G) * self.KSp
         )
-        return [fp8_load(w["rt"], w["rs"], ub + s, w["lane"]) for s in range(self.KSp)]
+        return [
+            fp8_row_load(w["rt"], w["rs"], ub + s, w["lane"]) for s in range(self.KSp)
+        ]
 
     @D.traced
     def run_cta(self, c, w, R, fin, pref, pflag, ep):
@@ -516,7 +522,9 @@ class MoeGemv:
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for s in range_constexpr(KSp):
                 xo = ch * KSp + s
-                acc = acc + fp8_compute(w, arow + xo * 128, xof + xo, self.XSR, buf[s])
+                acc = acc + fp8_row_compute(
+                    w, arow + xo * 128, xof + xo, self.XSR, buf[s]
+                )
             if t == hs:
                 # the head continues the previous wave's tail group: its prefix
                 _lds_wait(pflag + (wv - 1), ep)

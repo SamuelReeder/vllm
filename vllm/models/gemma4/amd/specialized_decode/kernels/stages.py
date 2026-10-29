@@ -32,8 +32,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from . import dev as D
 from .dims import EPS, VOCAB, H
+from .mkcore import dev as D
 
 NT = 512  # threads per CTA (set by the kernel builder before tracing)
 NOCT = H // 8  # threads that hold a row's columns (352)
@@ -327,7 +327,7 @@ def rebuild_h(c, M, red, h1, d, e, ssq_d, ssq_e, w1, w2, wpf, ls, h_out, name=""
 @D.traced
 def prologue_qkv(c, g, xq, xs, red, hh, k0, live, lnw):
     """Qkv GEMV input: x = h * rstd(h) * input_layernorm, quantized (g.C == 1: all K)."""
-    assert g.C == 1 and g.K == H and g.kind == "fp8"
+    assert g.C == 1 and g.K == H and g.kind == "fp8_row"
     M = g.M
     zero_xs_tail(c, g, xs)
     wv = _w8(D.rsrc(lnw), k0)
@@ -382,7 +382,7 @@ def prologue_final(c, M, xq, xr, red, hh, k0, live, lnw, out, lm_head):
     for t in range_constexpr(M):
         rs = fx.ptr_load(red + (64 + 24 + t))
         x = [hh[t][q] * rs * wv[q] for q in range(8)]
-        words = [D.pack_bf2(x[2 * q], x[2 * q + 1]) for q in range(4)]
+        words = [D.pack_bf2_rne(x[2 * q], x[2 * q + 1]) for q in range(4)]
         if const_expr(lm_head):
             if live:
                 fx.ptr_store(
@@ -440,7 +440,7 @@ def prologue_router(
     for t in range_constexpr(M):
         rs = fx.ptr_load(red + (64 + 8 + t))
         x = [h1[t][q] * rs * cinv * sv[q] for q in range(8)]
-        words = [D.pack_bf2(x[2 * q], x[2 * q + 1]) for q in range(4)]
+        words = [D.pack_bf2_rne(x[2 * q], x[2 * q + 1]) for q in range(4)]
         if live:
             fx.ptr_store(
                 fx.Vector.from_elements(words, fx.Int32), xq + (t * g.XR + k0 * 2) // 4

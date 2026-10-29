@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The kernel's copies of Gemma 4 26B-A4B's linear weights, packed from the model.
 
-Per layer the kernel streams (kernels/pack.py):
+Per layer the kernel streams (layouts: kernels/mkcore/pack.py, kind fp8_row):
   qkv    = qkv_proj (sliding: [q | k | v]; full: its [q | k] rows)
                                               fp8  (8192 / 9216 x 2816)
   o      = o_proj                             fp8  (2816 x 4096 / 8192)
@@ -25,8 +25,8 @@ are exact.
 
 import torch
 
-from ..kernels import pack
 from ..kernels.dims import EFF, EFFP, FFN, NDS, NL, QKV_F, H, is_full
+from ..kernels.mkcore import pack
 from ..spec import FP8_LINEARS, expert_parts, fp8_parts
 
 SMALL = (
@@ -110,7 +110,7 @@ class PackedWeights:
                 self.small[(i, n)] = t.contiguous()
 
     def _fp8(self, i: int, name: str, w: torch.Tensor, srow: torch.Tensor) -> None:
-        tiles, scales = pack.fp8_tiles(w, srow)
+        tiles, scales = pack.fp8_tiles_row(w, srow)
         C = self.chunks[name]
         self.mats[(i, name)] = (
             pack.unit_order(tiles, 3, C),

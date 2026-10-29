@@ -27,15 +27,13 @@ sliding layers and one for the full layers (Cfg); per layer the KV tensor, the b
 table of its KV cache group and the slot mapping. A row with slot[m] < 0 (padding)
 reads and writes no KV; a row with rowv[m] == 0 selects no routed expert.
 
-Every compile-time setting is a Cfg field or a debug global. The kernel name holds a hash
-of all of them; FlyDSL's disk cache keys on compile_key (the package sources and the Cfg),
-which the launcher holds.
+Every compile-time setting is a Cfg field or a debug global. FlyDSL's disk cache keys on
+mkcore.key.compile_key (the Cfg, the debug globals, the sources of mk/ and mkcore), which
+the launcher holds; the kernel name holds a hash of that key.
 """
 
 import functools
-import hashlib
 import pathlib
-import zlib
 from dataclasses import asdict, dataclass
 
 import flydsl.compiler as flyc
@@ -44,7 +42,6 @@ from flydsl.expr import const_expr, gpu, rocdl
 from flydsl.expr.typing import Int32, Int64
 
 from . import attention as A
-from . import dev as D
 from . import moe as MO
 from . import stages as S
 from .dims import (
@@ -62,13 +59,21 @@ from .dims import (
     WINDOW,
     H,
 )
-from .gemv import Gemv
+from .mkcore import dev as D
+from .mkcore import key as K
+from .mkcore.dev import (
+    _STREAM,
+    CNT_STRIDE,
+    EPOCH_WORD_LINE,
+    LDS_MAX,
+    NT,
+    PROFILE,
+    WAVES,
+)
+from .mkcore.gemv import Gemv
 
 NTAB = 24  # pointer-table slots per row
 NGLOB = 32  # global pointer-table slots
-WAVES = 8
-NT = 64 * WAVES
-LDS_MAX = 65536
 
 # global table slots
 (
@@ -133,9 +138,6 @@ LDS_MAX = 65536
     T_LS,
 ) = range(NTAB)
 
-_STREAM = fx.Stream(None)  # the launch's default: the current stream
-CNT_STRIDE = 65536  # i32 counters per counter region
-EPOCH_WORD_LINE = 8  # the epoch word is line cus + EPOCH_WORD_LINE of the flag buffer
 STAGES_PER_LAYER = 6
 
 
@@ -181,6 +183,7 @@ class Cfg:
     e1_cta: bool | None = None
     debug_route: bool = False  # store a hash of every CTA's routing tables (I5)
     fence: bool = False  # L2 write-back / invalidate at every grid barrier (dev.grid_*)
+    chaos: bool = False  # mkcore.key.COMMON_FIELDS; no barrier code reads it yet (M4)
 
     def __post_init__(self):
         if self.e1_cta is None:
@@ -200,7 +203,7 @@ class Cfg:
     def specs(self):
         M, cus, ch = self.M, self.cus, self.chunks()
 
-        def g(name, n, k, c, kind="fp8"):
+        def g(name, n, k, c, kind="fp8_row"):
             return Gemv(name, n, k, M, cus, WAVES, c, kind).check()
 
         return dict(
@@ -223,30 +226,9 @@ class Cfg:
 CNT_REGION = dict(qkv=0, o=1, router=2, e1=3, e2=4, lm=5, attn=6, done=7)
 
 
-PROFILE = {
-    "addr": None,  # debug: i64 [barriers][CUS][2] = (arrive, wait end) per CTA, 100 MHz
-    "npos": None,  # debug: i32 [layers]: MoE positions (distinct experts + 3) per layer
-}
-
-
-def compile_key(cfg, *extra) -> str:
-    """Key of FlyDSL's disk cache for one build. FlyDSL 0.4.0 keys on the launcher's
-    source and scalar closure values only: not on helpers called as D.*, cfg fields
-    read as cfg.*, or the kernel name (megakernels common/DESIGN.md, "Compile cache
-    test"). This key covers every .py file of this package and repr((cfg, *extra));
-    the launcher holds it."""
-    d = pathlib.Path(__file__).resolve().parent
-    h = hashlib.sha256(repr((cfg, *extra)).encode())
-    for p in sorted(d.rglob("*.py")):
-        h.update(str(p.relative_to(d)).encode() + b"\0" + p.read_bytes())
-    return h.hexdigest()
-
-
-def kernel_name(cfg: Cfg) -> str:
-    """Every compile-time setting goes into the name: the Cfg fields and the debug globals
-    (PROFILE and PROBE addresses are baked in). FlyDSL's disk cache keys on compile_key."""
-    key = repr((cfg, PROFILE, D.PROBE))
-    return f"gemma4_decode_m{cfg.M}_{zlib.crc32(key.encode()):08x}"
+NPOS = {
+    "addr": None
+}  # debug: i32 [layers]: MoE positions (distinct experts + 3) per layer
 
 
 def lds_bytes(cfg: Cfg):
@@ -279,13 +261,14 @@ def pref_floats(cfg: Cfg):
 
 def build(cfg: Cfg):
     M, CUS = cfg.M, cfg.cus
+    K.check_cfg(cfg)
     assert 1 <= M <= WAVES, "the routing and the rstd reductions give each row one wave"
     assert cfg.combine_rows or not cfg.e2_rows, (
         "e2_rows: the combine CTAs reduce the rows"
     )
     SP = cfg.specs()
     GEO = {False: cfg.geo(False), True: cfg.geo(True)}
-    D.FENCE["on"] = cfg.fence
+    D.configure(cfg)
     S.NT = NT
     XQB, XSF, AW, NP, lds = lds_bytes(cfg)
     assert lds <= LDS_MAX, f"STOP: I1 (LDS {lds} B > {LDS_MAX} B per CTA)"
@@ -321,9 +304,11 @@ def build(cfg: Cfg):
         v = D.ld(r, 2 * i, 2)
         return (fx.Int64(D.uniform(v[1])) << 32) | fx.Int64(fx.Uint32(D.uniform(v[0])))
 
-    # the kernel name is not in FlyDSL's disk-cache key; `key` is (see compile_key)
-    key = compile_key(cfg, PROFILE, D.PROBE)
-    name = kernel_name(cfg)
+    # the kernel name is not in FlyDSL's disk-cache key; `key` is (mkcore.key)
+    key = K.compile_key(
+        cfg, pathlib.Path(__file__).resolve().parent, PROFILE, D.PROBE, NPOS
+    )
+    name = K.kernel_name("gemma4_decode", cfg, key)
 
     @flyc.kernel(name=name, known_block_size=[NT, 1, 1])
     def kdec(tab: Int64, glob: Int64, nlayers: Int32):
@@ -533,7 +518,7 @@ def _moe(env, R, nlayers, pref, pflag):
 def _store_npos(c, npos, li):
     """Debug (bench/profile_decode.py): CTA 0 stores layer li's MoE position count."""
     if (c["bid"] == 0) & (c["tid"] == 0):
-        D.st(npos, D.rsrc(fx.Int64(PROFILE["npos"])), li, D.CM_DEV)
+        D.st(npos, D.rsrc(fx.Int64(NPOS["addr"])), li, D.CM_DEV)
 
 
 @D.traced
@@ -724,7 +709,7 @@ def _moe_t(
     MO.routing(c, M, logit, G[G_ROWV], T(T_PES), R)
     if const_expr(cfg.debug_route):
         MO.route_hash(c, M, R, G[G_SPARE], li, c["cus"], NL)
-    if const_expr(PROFILE["npos"] is not None):
+    if const_expr(NPOS["addr"] is not None):
         _store_npos(c, R.n(), li)
     if const_expr(cfg.router_publish):
         S.prologue_gu_copy(c, e1, xq, xs, G[G_XG], G[G_XGS])
