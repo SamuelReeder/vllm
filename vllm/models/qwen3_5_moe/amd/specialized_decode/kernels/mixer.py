@@ -34,7 +34,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from . import dev as D
 from . import stages as S
 from .dims import (
     A_OFF,
@@ -53,6 +52,8 @@ from .dims import (
     V_OFF,
     Z_OFF,
 )
+from .mkcore import dev as D
+from .mkcore.dev import bf16r, pack_bf2
 
 CH = 64  # attention positions per task
 PVB = 16  # P V: positions per load batch
@@ -209,17 +210,6 @@ def rms_rope(lane, vals, w_word, cs, rope):
         r2 = x[e] * cos[e] + partner * sin[e]  # d >= 32: x2 cos + x1 sin
         out.append(inr.select(lo.select(r1, r2), x[e]))
     return out
-
-
-def bf16r(v):
-    """Round f32 to bf16 and back (the KV cache precision)."""
-    return fx.Float32(fx.Float32(v).to(fx.BFloat16))
-
-
-def pack_bf2(a, b):
-    return (
-        fx.Vector.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
-    )
 
 
 @D.traced

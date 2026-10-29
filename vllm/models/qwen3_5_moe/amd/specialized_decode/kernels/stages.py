@@ -16,8 +16,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
-from . import dev as D
 from .dims import CONV_DIM, INP_N, VOCAB, H
+from .mkcore import dev as D
 
 NT = 512  # threads per CTA (set by the kernel builder before tracing)
 
@@ -56,7 +56,7 @@ def prologue_norm(c, g, xq, xs, red, h, ssq, lnw, eps):
     quantized per (token, 128 K). h: the bf16 copy of the residual (rstd comes from the
     fp32 sums of squares). The h loads go out before the rstd reduction."""
     M, K = g.M, g.K
-    assert K == H and g.kind == "fp8"
+    assert K == H and g.kind == "fp8_b128"
     tid = c["tid"]
     D.PROBE["on"] = D.PROBE.get("stage") == g.name
     D.probe(c, 5)

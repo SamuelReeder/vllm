@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Device-side helpers of the megakernel (FlyDSL, gfx942).
+# ruff: noqa: E501
+"""Device-side helpers of the megakernels (FlyDSL, gfx942), shared by every model
+(common/DESIGN.md D7: the union of the models' former mk/dev.py copies).
 
 Memory scopes (gfx94x CPol): CM_DEV = sc1 makes a store/load coherent across the
 XCDs (device scope). Every hand-off between CTAs uses CM_DEV on both sides.
 Spin loops contain s_sleep: a side effect that keeps LLVM from deleting the loop.
+bf16 rounding has two forms with the same results on finite inputs but different
+code: the integer round-to-nearest-even bf16_rne / pack_bf2_rne (Gemma) and the
+convert bf16r / pack_bf2 / bf16_pair (Qwen). A model keeps the one it uses (F1).
+Debug globals: PROBE, PROFILE (set by the bench scripts), FENCE and CHAOS (set from
+Cfg.fence / Cfg.chaos by configure; nothing else writes them).
 """
 
 from __future__ import annotations
@@ -19,8 +26,20 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 CM_DEV = 16
+CM_SYS = 17  # sc0 | sc1: system scope (peer GPUs over XGMI)
 CM_NT = 2
 LINE = 32  # i32 per 128 B cache line
+
+# grid of every kernel: one persistent CTA of WAVES waves per CU
+WAVES = 8
+NT = 64 * WAVES
+LDS_MAX = 65536
+_STREAM = fx.Stream(None)  # the launch's default: the current stream
+CNT_STRIDE = 65536  # i32 counters per counter region
+EPOCH_WORD_LINE = 8  # the epoch word is line cus + EPOCH_WORD_LINE of the flag buffer
+PROFILE = {
+    "addr": None
+}  # debug: i64 [barriers][CUS][2] = (arrive, wait end) per CTA, 100 MHz
 
 traced = ASTRewriter.transform
 
@@ -246,6 +265,53 @@ def silu(x):
     return fx.Float32(x) * sigmoid(x)
 
 
+def tanh(x):
+    """1 - 2 / (exp(2 x) + 1): +-1 at the overflow ends, absolute error about 1e-7."""
+    return fx.Float32(1.0) - fx.Float32(2.0) / (
+        expf(fx.Float32(x) * 2.0) + fx.Float32(1.0)
+    )
+
+
+def gelu_tanh(x):
+    """Gelu with the tanh approximation (HF gelu_pytorch_tanh)."""
+    x = fx.Float32(x)
+    u = x * (fx.Float32(1.0) + fx.Float32(0.044715) * x * x) * 0.7978845608028654
+    return fx.Float32(0.5) * x * (fx.Float32(1.0) + tanh(u))
+
+
+def bf16_rne(x):
+    """f32 -> bf16 bits (low 16 bits of an i32), round to nearest even, as torch and vLLM
+    round (finite inputs)."""
+    b = fx.Float32(x).bitcast(fx.Int32)
+    return ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) & 0xFFFF
+
+
+def pack_bf2_rne(a, b):
+    """Two f32 -> one i32 of two bf16 (a in the low half), round to nearest even."""
+    return bf16_rne(a) | (bf16_rne(b) << 16)
+
+
+def bf16r(v):
+    """f32 rounded to bf16 (RNE) and back (the KV cache precision)."""
+    return fx.Float32(fx.Float32(v).to(fx.BFloat16))
+
+
+def pack_bf2(a, b):
+    """Two f32 -> one i32 of two bf16 (a in the low half), by convert."""
+    return (
+        fx.Vector.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+    )
+
+
+def bf16_pair(a, b):
+    """Two f32 -> one f32-typed word holding (bf16(a), bf16(b)), RNE."""
+    return (
+        fx.Vector.from_elements([a, b], fx.Float32)
+        .to(fx.BFloat16)
+        .bitcast(fx.Float32)[0]
+    )
+
+
 def bf_lo(w):
     return (fx.Int32(w) << 16).bitcast(fx.Float32)
 
@@ -338,6 +404,13 @@ FENCE = {"on": False}  # debug (Cfg.fence): agent-scope release / acquire around
 CHAOS = {
     "on": False
 }  # debug (Cfg.chaos): random 0..7 us delays before arrivals and atomics
+
+
+def configure(cfg) -> None:
+    """Set the debug globals that mkcore code reads from the Cfg being built (at the start
+    of build, before tracing): FENCE from cfg.fence, CHAOS from cfg.chaos."""
+    FENCE["on"] = cfg.fence
+    CHAOS["on"] = cfg.chaos
 
 
 @traced

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """The kernel's copies of Qwen3.6-35B-A3B's linear weights, packed from the model.
 
-Per layer the kernel streams (kernels/pack.py):
+Per layer the kernel streams (layouts: kernels/mkcore/pack.py, kind fp8_b128):
   GDN layer:  inp    = in_proj_qkvz                          fp8  (12288 x 2048)
               ba     = in_proj_ba                            bf16 (64 x 2048)
               out    = out_proj                              fp8  (2048 x 4096)
@@ -25,8 +25,8 @@ are exact.
 
 import torch
 
-from ..kernels import pack
 from ..kernels.dims import NE, NL, H, is_attn
+from ..kernels.mkcore import pack
 from ..kernels.moe import LGN
 from ..spec import expert_parts, fp8_parts
 
@@ -47,7 +47,7 @@ GEMVS = {
 
 def checkpoint_scales(s: torch.Tensor, n: int) -> torch.Tensor:
     """Undo vLLM's doubling: e4m3fnuz block scales [.., N/128, K/128] -> the
-    checkpoint's per-row e4m3fn scales [.., N, K/128] that kernels/pack.py expects."""
+    checkpoint's per-row e4m3fn scales [.., N, K/128] (pack.fp8_tiles_b128 input)."""
     return pack.row_scales(s, n) * 0.5
 
 
@@ -99,7 +99,7 @@ class PackedWeights:
                 self.small[(i, n)] = t.detach().to(torch.bfloat16).contiguous()
 
     def _fp8(self, i: int, name: str, w: torch.Tensor, srow: torch.Tensor) -> None:
-        tiles, scales = pack.fp8_tiles(w, srow)
+        tiles, scales = pack.fp8_tiles_b128(w, srow)
         C = self.chunks[name]
         self.mats[(i, name)] = (
             pack.unit_order(tiles, 3, C),

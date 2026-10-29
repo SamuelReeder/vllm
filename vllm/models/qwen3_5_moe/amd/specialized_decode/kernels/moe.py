@@ -37,10 +37,10 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from . import dev as D
 from . import stages as S
 from .dims import NE, TOPK
-from .gemv import fp8_compute, fp8_load
+from .mkcore import dev as D
+from .mkcore.gemv import fp8_b128_compute, fp8_b128_load
 
 LGN = 272  # router GEMV rows: 256 experts, the shared gate, 15 zero rows
 NSLOT = TOPK + 1  # 8 routed slots + the shared expert
@@ -225,7 +225,7 @@ class MoeGemv:
     waves: int = 8
     C: int = 1  # K chunks per expert
 
-    kind = "fp8"
+    kind = "fp8_b128"
     esize = 1
     slots = 1  # (prologue_norm interface: all K in LDS)
 
@@ -329,7 +329,9 @@ class MoeGemv:
 
     def _load_piece(self, w, R, pi):
         ub = self._ubase(R, pi)
-        return [fp8_load(w["rt"], w["rs"], ub + s, w["lane"]) for s in range(self.KSp)]
+        return [
+            fp8_b128_load(w["rt"], w["rs"], ub + s, w["lane"]) for s in range(self.KSp)
+        ]
 
     @D.traced
     def run(self, c, w, R, part, cnt, fin, pos0=None):
@@ -362,7 +364,9 @@ class MoeGemv:
             acc = fx.Vector.filled(4, 0.0, fx.Float32)
             for s in range_constexpr(KSp):
                 xo = ch * KSp + s
-                acc = acc + fp8_compute(w, arow + xo * 128, xof + xo, self.XSR, buf[s])
+                acc = acc + fp8_b128_compute(
+                    w, arow + xo * 128, xof + xo, self.XSR, buf[s]
+                )
             if const_expr(self.mode == "gu"):
                 if w["gl"] < self.MT:
                     D.st(acc, rp, (pi * 64 + w["lane"]) * 4, D.CM_DEV)

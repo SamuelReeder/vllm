@@ -28,15 +28,13 @@ Caches use vLLM's layouts (Cfg holds their strides), as in the Qwen3.8 kernel:
 The barrier epoch lives on the device (word EPOCH_WORD of the flag buffer), so a
 launch has no per-step host argument and can be captured in a graph.
 
-Every compile-time setting is a Cfg field or a debug global, and the kernel name holds a
-hash of all of them. FlyDSL's disk cache does not key on the name; it keys on
-compile_key, which the launcher holds.
+Every compile-time setting is a Cfg field or a debug global. FlyDSL's disk cache keys on
+mkcore.key.compile_key (the Cfg, the debug globals, the sources of mk/ and mkcore),
+which the launcher holds; the kernel name holds a hash of that key.
 """
 
 import functools
-import hashlib
 import pathlib
-import zlib
 from dataclasses import asdict, dataclass
 
 import flydsl.compiler as flyc
@@ -44,7 +42,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr
 from flydsl.expr.typing import Int32, Int64
 
-from . import dev as D
 from . import mixer as X
 from . import moe as MO
 from . import stages as S
@@ -64,13 +61,21 @@ from .dims import (
     VOCAB,
     H,
 )
-from .gemv import Gemv
+from .mkcore import dev as D
+from .mkcore import key as K
+from .mkcore.dev import (
+    _STREAM,
+    CNT_STRIDE,
+    EPOCH_WORD_LINE,
+    LDS_MAX,
+    NT,
+    PROFILE,
+    WAVES,
+)
+from .mkcore.gemv import Gemv
 
 NTAB = 20  # pointer-table slots per layer
 NGLOB = 20  # global pointer-table slots
-WAVES = 8
-NT = 64 * WAVES
-LDS_MAX = 65536
 
 # global table slots
 (
@@ -116,9 +121,6 @@ T_QN, T_KN, T_KV = range(12, 15)  # attention layers
 # sidx[M]; an attention layer's block table bt[M][maxblocks] and slot mapping slot[M].
 T_IDX, T_SLOT = 18, 19
 
-_STREAM = fx.Stream(None)  # the launch's default: the current stream
-CNT_STRIDE = 65536  # i32 counters per counter region
-EPOCH_WORD_LINE = 8  # the epoch word is line cus + EPOCH_WORD_LINE of the flag buffer
 STAGES_PER_LAYER = 6
 
 
@@ -175,7 +177,7 @@ class Cfg:
     def specs(self):
         M, cus, ch = self.M, self.cus, self.chunks()
 
-        def g(name, n, k, kind="fp8", cta=False):
+        def g(name, n, k, kind="fp8_b128", cta=False):
             return Gemv(
                 name, n, k, M, cus, WAVES, ch[name], kind, cta=cta and self.cta_red
             ).check()
@@ -204,38 +206,12 @@ class Cfg:
 CNT_REGION = dict(inp=0, ba=1, out=2, qkv=3, o=4, router=5, e1=6, e2=7, lm=8)
 
 
-PROFILE = {
-    "addr": None
-}  # debug: i64 [barriers][CUS][2] = (arrive, wait end) per CTA, 100 MHz
-
-
-def kernel_name(cfg: Cfg) -> str:
-    """Every compile-time setting goes into the name: the Cfg fields and the debug
-    globals (PROFILE and PROBE addresses are baked in). FlyDSL's disk cache does not key
-    on the name; it keys on compile_key."""
-    key = repr((cfg, PROFILE, D.PROBE))
-    return f"qwen36moe_decode_m{cfg.M}_{zlib.crc32(key.encode()):08x}"
-
-
-def compile_key(cfg, *extra) -> str:
-    """Key of FlyDSL's disk cache for one build. FlyDSL 0.4.0 keys on the launcher's
-    source and scalar closure values only: not on helpers called as D.*, cfg fields
-    read as cfg.*, or the kernel name (megakernels common/DESIGN.md, "Compile cache
-    test"). This key covers every .py file of this package and repr((cfg, *extra));
-    the launcher holds it."""
-    d = pathlib.Path(__file__).resolve().parent
-    h = hashlib.sha256(repr((cfg, *extra)).encode())
-    for p in sorted(d.rglob("*.py")):
-        h.update(str(p.relative_to(d)).encode() + b"\0" + p.read_bytes())
-    return h.hexdigest()
-
-
 def build(cfg: Cfg):
     M, CUS = cfg.M, cfg.cus
+    K.check_cfg(cfg)
     assert 1 <= M <= WAVES, "the norm prologues and the routing give each row one wave"
     SP = cfg.specs()
-    D.FENCE["on"] = cfg.fence
-    D.CHAOS["on"] = cfg.chaos
+    D.configure(cfg)
     S.NT = NT
     NP = MO.npos_max(M)
     XQB = max(s.XR * (s.XROWS if isinstance(s, MO.MoeGemv) else M) for s in SP.values())
@@ -282,9 +258,9 @@ def build(cfg: Cfg):
         v = D.ld(r, 2 * i, 2)
         return (fx.Int64(D.uniform(v[1])) << 32) | fx.Int64(fx.Uint32(D.uniform(v[0])))
 
-    # the kernel name is not in FlyDSL's disk-cache key; `key` is (see compile_key)
-    key = compile_key(cfg, PROFILE, D.PROBE)
-    name = kernel_name(cfg)
+    # the kernel name is not in FlyDSL's disk-cache key; `key` is (mkcore.key)
+    key = K.compile_key(cfg, pathlib.Path(__file__).resolve().parent, PROFILE, D.PROBE)
+    name = K.kernel_name("qwen36moe_decode", cfg, key)
 
     @flyc.kernel(name=name, known_block_size=[NT, 1, 1])
     def kdec(tab: Int64, glob: Int64, nlayers: Int32):

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E501
 """Flat unit-stream GEMV of the megakernel.
 
 out[m, n] = sum_k x[m, k] W[n, k] for M <= 16 rows.
@@ -17,12 +18,19 @@ It then adds 1 to the group's counter (device-scope atomic); the wave that makes
 the count a multiple of the group's segment total sums all segments in fixed
 order (deterministic) and runs the epilogue for the group ("last arriver").
 
-Weight formats (`kind`; docs/DESIGN.md "Weight formats and the GEMV interface"):
-  "fp8":  fp8_tiles (2 KiB e4m3fnuz per unit) + 2 fp32 scales per unit (rows 0-7, rows
-          8-15); fp8 MFMA; x fp8 with a pow2 scale per (token, superstep).
-  "bf16": pack_bf16 tiles (4 KiB per unit), bf16 MFMA, x bf16, no scales.
-A new format (MXFP4: Qwen3.8's "mx") adds a branch to esize / load / compute / setup
-and a packer; the stages do not change.
+Weight formats (`kind`; common/DESIGN.md D8 and "The hardest divergences" 1):
+  "fp8_b128": fp8_tiles_b128 (2 KiB e4m3fnuz per unit) + 2 fp32 scales per unit (rows
+              0-7, rows 8-15; 128 x 128 block scales, Qwen3.6); fp8 MFMA; x fp8 with a
+              pow2 scale per (token, superstep).
+  "fp8_row":  as fp8_b128 with 16 fp32 scales per unit (one per output row; per-channel
+              scales, Gemma 4).
+  "mx":       MXFP4 mk4 tiles (fp4.py) decoded to fp8 for the fp8 MFMA, x as fp8_b128
+              (Qwen3.8).
+  "bf16":     pack_bf16 tiles (4 KiB per unit), bf16 MFMA, x bf16, no scales.
+Modes: `small` (U < NW: some waves own no unit; their piece count is selected to 0,
+the only mode with that select), `cta` (CTA-local split-K through LDS), and the
+epilogue protocol: `epilogue(cg, tots[, pre])`, optional `pre(cg)`, optional
+`deferred = True` with `push(cg, tots)` and `finish(cg)` (Qwen3.8 TP2).
 """
 
 from __future__ import annotations
@@ -34,8 +42,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from . import dev as D
+from . import fp4
+from .pack import PAD_TILES
 
-PAD_TILES = 16  # spare tiles after a packed matrix (>= 3 P - 1)
+H4 = fp4.device_helpers()
 
 
 def mfma_fp8(a, b, c):
@@ -52,18 +62,8 @@ def _imin(a, b):
     return fx.min(a, b)
 
 
-def fp8_load(rt, rs, u, lane):
-    """Unit u of an fp8 matrix: the lane's 2 x 16 B of the 2 KiB tile (load q holds
-    MFMA steps 2 q, 2 q + 1) and the unit's 2 scales (rows 0-7, rows 8-15)."""
-    t0 = D.ld(rt, (u * 128 + lane) * 4, 4, cm=D.CM_NT)
-    t1 = D.ld(rt, (u * 128 + 64 + lane) * 4, 4, cm=D.CM_NT)
-    return (t0, t1), D.ld(rs, u * 2, 2, T.f32)
-
-
-def fp8_compute(w, arow, xo, xsr, ops):
-    """One fp8 unit: 4 MFMAs (32 K each) into one accumulator, then x the weight scale
-    of the lane's row (col < 8: rows 0-7) and the x scale of each token."""
-    (t0, t1), ws = ops
+def _fp8_acc(w, arow, t0, t1):
+    """4 fp8 MFMAs (32 K each) of one unit into one accumulator."""
     acc = fx.Vector.filled(4, 0.0, fx.Float32)
     for d in range_constexpr(4):
         a = fx.Vector(
@@ -77,12 +77,53 @@ def fp8_compute(w, arow, xo, xsr, ops):
             [tq[2 * (d % 2)], tq[2 * (d % 2) + 1]], fx.Int32
         ).bitcast(fx.Int64)[0]
         acc = mfma_fp8(a, b, acc)
-    wsc = (w["col"] < 8).select(ws[0], ws[1])
+    return acc
+
+
+def _fp8_scaled(w, acc, xo, xsr, wsc):
     xs = fx.Vector.from_elements(
         [fx.ptr_load(w["xs"] + ((4 * w["gl"] + r) * xsr + xo)) * wsc for r in range(4)],
         fx.Float32,
     )
     return acc * xs
+
+
+def fp8_b128_load(rt, rs, u, lane):
+    """Unit u of an fp8_b128 matrix: the lane's 2 x 16 B of the 2 KiB tile (load q holds
+    MFMA steps 2 q, 2 q + 1) and the unit's 2 scales (rows 0-7, rows 8-15)."""
+    t0 = D.ld(rt, (u * 128 + lane) * 4, 4, cm=D.CM_NT)
+    t1 = D.ld(rt, (u * 128 + 64 + lane) * 4, 4, cm=D.CM_NT)
+    return (t0, t1), D.ld(rs, u * 2, 2, T.f32)
+
+
+def fp8_b128_compute(w, arow, xo, xsr, ops):
+    """One fp8_b128 unit: 4 MFMAs into one accumulator, then x the weight scale of the
+    lane's row (col < 8: rows 0-7) and the x scale of each token."""
+    (t0, t1), ws = ops
+    acc = _fp8_acc(w, arow, t0, t1)
+    return _fp8_scaled(w, acc, xo, xsr, (w["col"] < 8).select(ws[0], ws[1]))
+
+
+def fp8_row_load(rt, rs, u, lane):
+    """Unit u of an fp8_row matrix: the tile as fp8_b128_load and the scale of the
+    lane's row (lane % 16)."""
+    t0 = D.ld(rt, (u * 128 + lane) * 4, 4, cm=D.CM_NT)
+    t1 = D.ld(rt, (u * 128 + 64 + lane) * 4, 4, cm=D.CM_NT)
+    return (t0, t1), D.ld(rs, u * 16 + lane % 16, 1, T.f32)
+
+
+def fp8_row_compute(w, arow, xo, xsr, ops):
+    """One fp8_row unit: 4 MFMAs into one accumulator, then x the weight scale of the
+    lane's row and the x scale of each token."""
+    (t0, t1), ws = ops
+    acc = _fp8_acc(w, arow, t0, t1)
+    return _fp8_scaled(w, acc, xo, xsr, ws)
+
+
+FP8_KINDS = {
+    "fp8_b128": (fp8_b128_load, fp8_b128_compute),
+    "fp8_row": (fp8_row_load, fp8_row_compute),
+}
 
 
 @dataclass(frozen=True)
@@ -94,7 +135,7 @@ class Gemv:
     cus: int
     waves: int = 8
     C: int = 1  # K chunks
-    kind: str = "fp8"  # "fp8" | "bf16"
+    kind: str = "bf16"  # "fp8_b128" | "fp8_row" | "mx" | "bf16"
     P: int = 2  # units per pipeline block
     gpc: int = 1  # groups per counter (last-arriver granularity)
     # CTA-local split-K: CTA b streams whole groups [b G / cus, (b + 1) G / cus), its
@@ -139,7 +180,7 @@ class Gemv:
 
     @property
     def esize(self):
-        return 1 if self.kind == "fp8" else 2
+        return 2 if self.kind == "bf16" else 1
 
     @property
     def XR(self):
@@ -241,8 +282,12 @@ class Gemv:
     # PAD_TILES spare tiles: unit u's data is tile u, so a load needs no index math.
     def load(self, w, u):
         """Unit u's weight data for this lane."""
-        if const_expr(self.kind == "fp8"):
-            return fp8_load(w["rt"], w["rs"], u, w["lane"])
+        if const_expr(self.kind in FP8_KINDS):
+            return FP8_KINDS[self.kind][0](w["rt"], w["rs"], u, w["lane"])
+        if const_expr(self.kind == "mx"):
+            tile = D.ld(w["rt"], (u * 64 + w["lane"]) * 4, 4, cm=D.CM_NT)
+            sw = D.ld(w["rs"], u * 16 + w["col"])
+            return tile, sw
         # bf16 (LM head, > 2 GiB): a 64-bit tile base per unit (wave-uniform)
         rt = D.rsrc(w["tbase"] + fx.Int64(u) * 4096)
         return [D.ld(rt, (q * 64 + w["lane"]) * 4, 4, cm=D.CM_NT) for q in range(4)]
@@ -253,8 +298,34 @@ class Gemv:
         their result is dropped with a select; a multiply by 0 would keep NaN/inf)."""
         arow = w["arow"] + xo * (128 * self.esize)
         z4 = fx.Vector.filled(4, 0.0, fx.Float32)
-        if const_expr(self.kind == "fp8"):
-            return fp8_compute(w, arow, xo, self.XSR, ops)
+        if const_expr(self.kind in FP8_KINDS):
+            return FP8_KINDS[self.kind][1](w, arow, xo, self.XSR, ops)
+        if const_expr(self.kind == "mx"):
+            tile, sw = ops
+            tacc = z4
+            for d in range_constexpr(4):
+                a = fx.Vector(
+                    fx.ptr_load(
+                        w["xq"] + (arow + 32 * d) // 4,
+                        result_type=fx.Vector.make_type(2, fx.Int32),
+                    )
+                ).bitcast(fx.Int64)[0]
+                t = H4["mfma"](a, H4["dec_dword"](tile[d]), z4)
+                tacc = D.fma4(
+                    t,
+                    fx.Vector.filled(
+                        4, H4["e8m0_f32"]((sw >> (8 * d)) & 0xFF), fx.Float32
+                    ),
+                    tacc,
+                )
+            xs = fx.Vector.from_elements(
+                [
+                    fx.ptr_load(w["xs"] + ((4 * w["gl"] + r) * self.XSR + xo))
+                    for r in range(4)
+                ],
+                fx.Float32,
+            )
+            return tacc * xs
         acc = z4
         for q in range_constexpr(4):
             for h in range_constexpr(2):
@@ -281,7 +352,7 @@ class Gemv:
         lane, gl, col = c["lane"], c["gl"], c["col"]
         bid = c["bid"]
         w = dict(lane=lane, gl=gl, col=col, xq=xq, xs=xs, tbase=tiles)
-        if const_expr(self.kind == "fp8"):
+        if const_expr(self.kind != "bf16"):
             w["rt"], w["rs"] = D.rsrc(tiles), D.rsrc(scales)
         # A operand: token = lane % 16 (clamped to M - 1; its scale row is 0 past M)
         w["arow"] = fx.min(col, self.M - 1) * self.XR + 8 * gl * self.esize // 1
@@ -404,8 +475,12 @@ class Gemv:
             # completed
             rocdl.s_waitcnt(vmcnt=0)
             p0 = u0 // KSc
-            # a wave with no units (U < NW: the router, in_proj b/a) counts no piece
-            np_ = (u1 > u0).select((u1 - 1) // KSc + 1 - p0, fx.Int32(0))
+            if const_expr(self.small):
+                # a wave with no units (U < NW: the router, in_proj b/a) counts no piece
+                np_ = (u1 > u0).select((u1 - 1) // KSc + 1 - p0, fx.Int32(0))
+            else:
+                # U >= NW: every wave owns at least one unit (D8)
+                np_ = (u1 - 1) // KSc + 1 - p0
             olds = []
             for j in range_constexpr(self.NPW):
                 old = fx.Int32(0)
@@ -413,13 +488,23 @@ class Gemv:
                     old = D.atomic_add_dev(cnt + self.cgroup(p0 + j) * 4, 1)
                 olds.append(D.uniform(old))
             D.probe(c, 3)
+            deferred = getattr(epilogue, "deferred", False)
             for j in range_constexpr(self.NPW):
                 if (j < np_) & ((olds[j] + 1) == self.cg_total(self.cgroup(p0 + j))):
                     # the last arriver resets the counter for the next layer: every
                     # other arrival is in, and the next use is behind a grid barrier
                     if w["lane"] == 0:
                         D.st(fx.Int32(0), D.rsrc(cnt), self.cgroup(p0 + j), D.CM_DEV)
-                    self.la_reduce(w["lane"], self.cgroup(p0 + j), rp, epilogue, c)
+                    self.la_reduce(
+                        w["lane"], self.cgroup(p0 + j), rp, epilogue, c, deferred
+                    )
+            if const_expr(deferred):
+                # deferred poll: every group's push is out before the first poll
+                for j in range_constexpr(self.NPW):
+                    if (j < np_) & (
+                        (olds[j] + 1) == self.cg_total(self.cgroup(p0 + j))
+                    ):
+                        self.la_finish(epilogue, self.cgroup(p0 + j))
         D.probe(c, 2)
 
     def _lds_slot(self, v, j, lane):
@@ -504,12 +589,19 @@ class Gemv:
                 total = total + n
         return total
 
+    def la_finish(self, epilogue, cg):
+        """Deferred poll: the poll and the stores of a group whose push la_reduce issued
+        (a method, so the dynamic if above does not carry the epilogue as state)."""
+        epilogue.finish(cg)
+
     @D.traced
-    def la_reduce(self, lane, cg, rp, epilogue, c=None):
+    def la_reduce(self, lane, cg, rp, epilogue, c=None, push_only=False):
         """Sum every segment of the counter group's pieces (fixed order) -> epilogue.
         A batch of groups' segment loads goes out together (dead segments masked)."""
         # the epilogue's own input loads (if any) go out with the partial loads
-        pre = epilogue.pre(cg) if hasattr(epilogue, "pre") else None
+        pre = None
+        if const_expr(not push_only and hasattr(epilogue, "pre")):
+            pre = epilogue.pre(cg)
         tots = []
         nb = 4
         for j0 in range_constexpr(0, self.gpc, nb):
@@ -537,7 +629,9 @@ class Gemv:
                         [ok.select(tot[r] + v[r], tot[r]) for r in range(4)], fx.Float32
                     )
                 tots.append(tot)
-        if pre is None:
+        if const_expr(push_only):
+            epilogue.push(cg, tots)
+        elif const_expr(pre is None):
             epilogue(cg, tots)
         else:
             epilogue(cg, tots, pre)
