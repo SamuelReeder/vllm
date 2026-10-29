@@ -32,6 +32,8 @@ launch has no per-step host argument and can be captured in a CUDA graph.
 """
 
 import functools
+import hashlib
+import pathlib
 import zlib
 from dataclasses import dataclass
 
@@ -155,6 +157,19 @@ PROFILE = {
 }  # debug: i64 [barriers][CUS][2] = (arrive, wait end) per CTA, 100 MHz
 
 
+def compile_key(cfg, *extra) -> str:
+    """Key of FlyDSL's disk cache for one build. FlyDSL 0.4.0 keys on the launcher's
+    source and scalar closure values only: not on helpers called as D.*, cfg fields
+    read as cfg.*, or the kernel name (megakernels common/DESIGN.md, "Compile cache
+    test"). This key covers every .py file of this package and repr((cfg, *extra));
+    the launcher holds it."""
+    d = pathlib.Path(__file__).resolve().parent
+    h = hashlib.sha256(repr((cfg, *extra)).encode())
+    for p in sorted(d.rglob("*.py")):
+        h.update(str(p.relative_to(d)).encode() + b"\0" + p.read_bytes())
+    return h.hexdigest()
+
+
 def build(cfg: Cfg):
     M, CUS = cfg.M, cfg.cus
     assert 1 <= M <= WAVES, "the norm prologues give each row one wave"
@@ -188,8 +203,8 @@ def build(cfg: Cfg):
         v = D.ld(r, 2 * i, 2)
         return (fx.Int64(D.uniform(v[1])) << 32) | fx.Int64(fx.Uint32(D.uniform(v[0])))
 
-    # FlyDSL's disk cache keys on the name, the source and scalar closure values, not
-    # on cfg's fields: every field goes into the name, or two geometries share a binary
+    # the kernel name is not in FlyDSL's disk-cache key; `key` is (see compile_key)
+    key = compile_key(cfg)
     name = f"qwen38_decode_m{M}_{zlib.crc32(repr(cfg).encode()):08x}"
 
     @flyc.kernel(name=name, known_block_size=[NT, 1, 1])
@@ -380,6 +395,7 @@ def build(cfg: Cfg):
 
     @flyc.jit
     def launch(tab: Int64, glob: Int64, nlayers: Int32, stream: fx.Stream = _STREAM):
+        key  # noqa: B018  a str closure value: FlyDSL puts it in the disk-cache key
         kdec(tab, glob, nlayers).launch(grid=(CUS,), block=(NT,), stream=stream)
 
     return launch
