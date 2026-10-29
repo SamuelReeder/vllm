@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from . import dev as D
@@ -97,6 +97,10 @@ class Gemv:
     kind: str = "fp8"  # "fp8" | "bf16"
     P: int = 2  # units per pipeline block
     gpc: int = 1  # groups per counter (last-arriver granularity)
+    # CTA-local split-K: CTA b streams whole groups [b G / cus, (b + 1) G / cus), its
+    # waves split their units evenly, and the CTA sums the wave partials in LDS (fixed
+    # wave order): no global partials, no counter atomics (needs C = 1)
+    cta: bool = False
 
     @property
     def G(self):
@@ -151,14 +155,38 @@ class Gemv:
     # waves of a CTA differently was measured: no gain; see docs/DESIGN.md.)
     # A GEMV with fewer units than waves (the router, in_proj b/a: "small") gives wave
     # gw < U unit gw instead, so a piece's segments sit in consecutive waves.
+    # cta: wave w of CTA b streams [g0 KS + w n / waves, g0 KS + (w + 1) n / waves) of
+    # the CTA's n = (g1 - g0) KS units, [g0, g1) = [b G / cus, (b + 1) G / cus).
     @property
     def small(self):
-        return self.U < self.NW
+        return not self.cta and self.U < self.NW
+
+    def cta_groups(self, bid):
+        return (bid * self.G) // self.cus, ((bid + 1) * self.G) // self.cus
 
     def wave_lo(self, gw):
+        if self.cta:
+            b, v = gw // self.waves, gw % self.waves
+            g0, g1 = self.cta_groups(b)
+            return g0 * self.KS + (v * ((g1 - g0) * self.KS)) // self.waves
         if self.small:
             return _imin(gw, self.U)
         return (gw * self.U) // self.NW
+
+    @property
+    def NGC(self):
+        """cta: max groups of one CTA."""
+        return -(-self.G // self.cus)
+
+    @property
+    def NPWC(self):
+        """cta: max pieces (groups) one wave's range touches."""
+        upw = -(-self.NGC * self.KS // self.waves)  # max units of one wave
+        return -(-upw // self.KS) + 1
+
+    def lds_floats(self):
+        """cta: LDS floats of the wave partials [waves][NPWC][16 MT lanes][4]."""
+        return self.waves * self.NPWC * 16 * self.MT * 4 if self.cta else 0
 
     def wave_of(self, u):
         """Global wave whose range holds unit u."""
@@ -183,6 +211,12 @@ class Gemv:
         )
         assert (self.U + 1) * self.NW < 2**31
         assert self.G % self.gpc == 0
+        if self.cta:
+            assert self.C == 1 and self.gpc == 1, "cta: a CTA holds whole groups, all K"
+            for gw in range(self.NW):
+                lo, hi = self.wave_lo(gw), self.wave_lo(gw + 1)
+                assert hi == lo or (hi - 1) // self.KS - lo // self.KS < self.NPWC
+            return self
         assert max(self.nseg_host(p) for p in range(self.C * self.G)) <= self.SEGMAX
         if self.small and self.C > 1:
             # a CTA's 8 units then lie in one chunk (slots == 1)
@@ -190,7 +224,7 @@ class Gemv:
         return self
 
     def part_floats(self):
-        return self.C * self.G * self.SEGMAX * 256
+        return 0 if self.cta else self.C * self.G * self.SEGMAX * 256
 
     # ------------------------------------------------------------ device
     def cta_range(self, bid):
@@ -258,10 +292,26 @@ class Gemv:
         w["gw"] = gw
         w["u0"] = self.wave_lo(gw)
         w["u1"] = self.wave_lo(gw + 1)
+        if const_expr(self.cta):
+            w["bid"], w["wave"], w["pl"] = bid, c["wave"], c["pl"]
         return w
 
     def first_loads(self, w):
-        return [self.load(w, w["u0"] + p) for p in range(self.P)]
+        u = w["u0"]
+        if const_expr(self.cta):
+            # an idle wave (a CTA without groups) loads tile 0 (an L2 hit) instead of
+            # the next CTA's tiles
+            u = (w["u1"] > u).select(u, fx.Int32(0))
+        return [self.load(w, u + p) for p in range(self.P)]
+
+    def busy(self, bid):
+        """Whether CTA bid streams any unit of this GEMV (needs its LDS x)."""
+        if self.cta:
+            g0, g1 = self.cta_groups(bid)
+            return g1 > g0
+        if self.small:
+            return bid * self.waves < self.U
+        return bid >= 0
 
     @D.traced
     def run(self, c, w, buf, part, cnt, epilogue):
@@ -342,28 +392,75 @@ class Gemv:
         last = u1 - 1
         if ((last // KSc) != ((u0 + (nblk - 1) * P) // KSc)) & (nblk > 0):
             self.store_part(w, last // KSc, acc_a, rp)
-        # counters after the whole stream: one drain, then all the wave's atomics at
-        # once (their round trips overlap), then the reductions of the groups it
-        # completed
-        rocdl.s_waitcnt(vmcnt=0)
-        p0 = u0 // KSc
-        # a wave with no units (U < NW: the router, in_proj b/a) counts no piece
-        np_ = (u1 > u0).select((u1 - 1) // KSc + 1 - p0, fx.Int32(0))
-        olds = []
-        for j in range_constexpr(self.NPW):
-            old = fx.Int32(0)
-            if (w["lane"] == 0) & (j < np_):
-                old = D.atomic_add_dev(cnt + self.cgroup(p0 + j) * 4, 1)
-            olds.append(D.uniform(old))
-        D.probe(c, 3)
-        for j in range_constexpr(self.NPW):
-            if (j < np_) & ((olds[j] + 1) == self.cg_total(self.cgroup(p0 + j))):
-                # the last arriver resets the counter for the next layer: every other
-                # arrival is in, and the next use is behind a grid barrier
-                if w["lane"] == 0:
-                    D.st(fx.Int32(0), D.rsrc(cnt), self.cgroup(p0 + j), D.CM_DEV)
-                self.la_reduce(w["lane"], self.cgroup(p0 + j), rp, epilogue, c)
+        if const_expr(self.cta):
+            # the CTA's wave partials are in LDS: one CTA barrier, then wave li % waves
+            # sums the li-th group of the CTA and runs its epilogue
+            gpu.barrier()
+            D.probe(c, 3)
+            self.cta_reduce(w, epilogue)
+        else:
+            # counters after the whole stream: one drain, then all the wave's atomics at
+            # once (their round trips overlap), then the reductions of the groups it
+            # completed
+            rocdl.s_waitcnt(vmcnt=0)
+            p0 = u0 // KSc
+            # a wave with no units (U < NW: the router, in_proj b/a) counts no piece
+            np_ = (u1 > u0).select((u1 - 1) // KSc + 1 - p0, fx.Int32(0))
+            olds = []
+            for j in range_constexpr(self.NPW):
+                old = fx.Int32(0)
+                if (w["lane"] == 0) & (j < np_):
+                    old = D.atomic_add_dev(cnt + self.cgroup(p0 + j) * 4, 1)
+                olds.append(D.uniform(old))
+            D.probe(c, 3)
+            for j in range_constexpr(self.NPW):
+                if (j < np_) & ((olds[j] + 1) == self.cg_total(self.cgroup(p0 + j))):
+                    # the last arriver resets the counter for the next layer: every
+                    # other arrival is in, and the next use is behind a grid barrier
+                    if w["lane"] == 0:
+                        D.st(fx.Int32(0), D.rsrc(cnt), self.cgroup(p0 + j), D.CM_DEV)
+                    self.la_reduce(w["lane"], self.cgroup(p0 + j), rp, epilogue, c)
         D.probe(c, 2)
+
+    def _lds_slot(self, v, j, lane):
+        """cta: LDS float index of wave v's j-th piece partial, lane `lane`."""
+        return ((v * self.NPWC + j) * (16 * self.MT) + lane) * 4
+
+    @D.traced
+    def cta_reduce(self, w, epilogue):
+        """cta: sum each group's wave partials in wave order (each wave's own sum runs
+        in unit order), then the epilogue. The order depends only on G and the CTA
+        count, so the result is the same for every batch and run (P1, P2)."""
+        g0, g1 = self.cta_groups(w["bid"])
+        for li in range_constexpr(self.NGC):
+            if (g0 + li < g1) & (w["wave"] == li % self.waves):
+                self._cta_group(w, g0, g1, g0 + li, epilogue)
+
+    @D.traced
+    def _cta_group(self, w, g0, g1, gi, epilogue):
+        KS, W = self.KS, self.waves
+        n = (g1 - g0) * KS
+        lane = fx.min(w["lane"], 16 * self.MT - 1)
+        pre = epilogue.pre(gi) if hasattr(epilogue, "pre") else None
+        tot = fx.Vector.filled(4, 0.0, fx.Float32)
+        for v in range_constexpr(W):
+            lo = g0 * KS + (v * n) // W
+            hi = g0 * KS + ((v + 1) * n) // W
+            hit = (hi > lo) & (lo < (gi + 1) * KS) & (hi > gi * KS)
+            base = self._lds_slot(
+                v, fx.min(fx.max(gi - lo // KS, 0), self.NPWC - 1), lane
+            )
+            tot = fx.Vector.from_elements(
+                [
+                    hit.select(tot[r] + fx.ptr_load(w["pl"] + (base + r)), tot[r])
+                    for r in range(4)
+                ],
+                fx.Float32,
+            )
+        if const_expr(pre is None):
+            epilogue(gi, [tot])
+        else:
+            epilogue(gi, [tot], pre)
 
     def nseg(self, p):
         wf = self.wave_of(p * self.KSc)
@@ -372,15 +469,21 @@ class Gemv:
     @D.traced
     def store_part(self, w, p, acc, rp):
         """Piece p's partial of this wave -> slot [p][gw - first wave of p] (device
-        scope)."""
-        wf, _ = self.nseg(p)
-        if w["gl"] < self.MT:
-            D.st(
-                acc,
-                rp,
-                ((p * self.SEGMAX + w["gw"] - wf) * 64 + w["lane"]) * 4,
-                D.CM_DEV,
-            )
+        scope); cta: -> LDS slot [wave][p - first piece of the wave]."""
+        if const_expr(self.cta):
+            if w["gl"] < self.MT:
+                base = self._lds_slot(w["wave"], p - w["u0"] // self.KS, w["lane"])
+                for r in range_constexpr(4):
+                    fx.ptr_store(acc[r], w["pl"] + (base + r))
+        else:
+            wf, _ = self.nseg(p)
+            if w["gl"] < self.MT:
+                D.st(
+                    acc,
+                    rp,
+                    ((p * self.SEGMAX + w["gw"] - wf) * 64 + w["lane"]) * 4,
+                    D.CM_DEV,
+                )
 
     @property
     def NPW(self):

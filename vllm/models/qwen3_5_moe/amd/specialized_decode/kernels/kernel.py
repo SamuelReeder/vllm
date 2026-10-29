@@ -29,7 +29,8 @@ The barrier epoch lives on the device (word EPOCH_WORD of the flag buffer), so a
 launch has no per-step host argument and can be captured in a graph.
 
 Every compile-time setting is a Cfg field or a debug global, and the kernel name holds a
-hash of all of them: FlyDSL's disk cache keys on the name, not on the fields.
+hash of all of them. FlyDSL's disk cache does not key on the name; it keys on
+compile_key, which the launcher holds.
 """
 
 import functools
@@ -141,7 +142,7 @@ class Cfg:
     lm_head: bool = True  # False: write the normed hidden states instead of logits
     c_inp: int = 1
     c_ba: int = 8
-    c_out: int = 2
+    c_out: int = 1  # cta_red needs one chunk (2 with the global hand-off)
     c_qkv: int = 1
     c_o: int = 16  # one head per K chunk: the prologue merges one head (prologue_attn)
     c_router: int = 1
@@ -150,6 +151,14 @@ class Cfg:
     c_lm: int = 1  # 8 -> 1: 3.36 -> 3.26 ms at M = 1 (fewer partial hand-offs)
     debug_route: bool = False  # store a hash of every CTA's routing tables (I5)
     fence: bool = False  # L2 write-back / invalidate at every grid barrier (dev.grid_*)
+    chaos: bool = False  # random delays before arrivals and counter atomics (dev.CHAOS)
+    # in_proj fp8, qkv, out_proj, router: CTA-local split-K, LDS reduction
+    # (gemv.Gemv.cta; needs their K chunks = 1). False: the global last-arriver
+    # hand-off (before 2026-10-29; docs/DESIGN.md, "Fixed stage cost")
+    cta_red: bool = True
+    # norm / scaled prologues only in CTAs that stream units of the GEMV (Gemv.busy):
+    # in_proj b / a, out_proj, router
+    skip_idle: bool = True
 
     def chunks(self):
         return {k[2:]: v for k, v in asdict(self).items() if k.startswith("c_")}
@@ -166,16 +175,18 @@ class Cfg:
     def specs(self):
         M, cus, ch = self.M, self.cus, self.chunks()
 
-        def g(name, n, k, kind="fp8"):
-            return Gemv(name, n, k, M, cus, WAVES, ch[name], kind).check()
+        def g(name, n, k, kind="fp8", cta=False):
+            return Gemv(
+                name, n, k, M, cus, WAVES, ch[name], kind, cta=cta and self.cta_red
+            ).check()
 
         return dict(
-            inp=g("inp", QKVZ_N, H),
+            inp=g("inp", QKVZ_N, H, cta=True),
             ba=g("ba", 2 * NVH, H, "bf16"),
-            out=g("out", H, VAL_DIM),
-            qkv=g("qkv", QKV_N, H),
+            out=g("out", H, VAL_DIM, cta=True),
+            qkv=g("qkv", QKV_N, H, cta=True),
             o=g("o", H, NQ * HD),
-            router=g("router", MO.LGN, H, "bf16"),
+            router=g("router", MO.LGN, H, "bf16", cta=True),
             e1=MO.MoeGemv("e1", 2 * FI, H, M, cus, "gu", WAVES, ch["e1"]).check(),
             e2=MO.MoeGemv("e2", H, FI, M, cus, "down", WAVES, ch["e2"]).check(),
             lm=g("lm", VOCAB, H, "bf16"),
@@ -224,11 +235,13 @@ def build(cfg: Cfg):
     assert 1 <= M <= WAVES, "the norm prologues and the routing give each row one wave"
     SP = cfg.specs()
     D.FENCE["on"] = cfg.fence
+    D.CHAOS["on"] = cfg.chaos
     S.NT = NT
     NP = MO.npos_max(M)
     XQB = max(s.XR * (s.XROWS if isinstance(s, MO.MoeGemv) else M) for s in SP.values())
     XBB = SP["ba"].XR * M  # in_proj's bf16 x (b / a), beside the fp8 x
     XSF = 32 * max(s.XSR for s in SP.values())
+    PRF = max([s.lds_floats() for s in SP.values() if isinstance(s, Gemv)] + [4])
     ATT_W = X.QW + HD  # floats per wave (q bf16, then k_new v_new bf16 pairs)
     NTASK_G = M * NVH * 8
     NTASK_A = M * NKV * cfg.ncmax
@@ -238,6 +251,7 @@ def build(cfg: Cfg):
         xq: fx.Array[fx.Int32, (XQB + 3) // 4, 16]
         xb: fx.Array[fx.Int32, (XBB + 3) // 4, 16]
         xs: fx.Array[fx.Float32, XSF, 16]
+        pr: fx.Array[fx.Float32, PRF, 16]  # cta GEMVs: the wave partials
 
     @fx.struct
     class MixLds:
@@ -259,7 +273,7 @@ def build(cfg: Cfg):
         npos: fx.Array[fx.Int32, 4, 16]
         rmask: fx.Array[fx.Int32, M * 8, 16]  # routing: row m's 256-bit expert set
 
-    lds = max(XQB + XBB + 4 * XSF, 4 * WAVES * ATT_W) + 4 * (
+    lds = max(XQB + XBB + 4 * XSF + 4 * PRF, 4 * WAVES * ATT_W) + 4 * (
         16 + M * MO.TOPK + M * MO.NSLOT + NP + 3 + NE + M * NP + 4 + M * 8
     )
     assert lds <= LDS_MAX, f"STOP: I1 (LDS {lds} B > {LDS_MAX} B per CTA)"
@@ -303,6 +317,7 @@ def build(cfg: Cfg):
         st_lds = alloc.allocate(StageLds)
         gl_, xl_ = st_lds.g.peek(), st_lds.x.peek()
         xq, xb, xs = gl_.xq.ptr, gl_.xb.ptr, gl_.xs.ptr
+        c["pl"] = gl_.pr.ptr
         wl = xl_.aw.ptr + wave * ATT_W
         rg = D.rsrc(glob)
         rt = D.rsrc(tab)
@@ -485,7 +500,14 @@ def _gdn_layer_t(
     # in_proj: fp8 [qkv | z] and bf16 [b | a] on the same normed input
     w, buf = barrier_then(inp, T(T_MIX_T), T(T_MIX_S), e0)
     S.prologue_norm(c, inp, xq, xs, red, hf0, q0, T(T_IN_LN), EPS)
-    S.prologue_norm_bf16(c, ba, xb, red, hf0, q0, T(T_IN_LN), EPS)
+    if const_expr(cfg.skip_idle):
+        _if_busy(
+            ba,
+            c["bid"],
+            lambda: S.prologue_norm_bf16(c, ba, xb, red, hf0, q0, T(T_IN_LN), EPS),
+        )
+    else:
+        S.prologue_norm_bf16(c, ba, xb, red, hf0, q0, T(T_IN_LN), EPS)
     inp.run(
         c,
         w,
@@ -523,7 +545,12 @@ def _gdn_layer_t(
         )
     # out_proj (+ residual)
     w, buf = barrier_then(out, T(T_OUT_T), T(T_OUT_S), e0 + 2)
-    S.prologue_scaled(c, out, xq, xs, y2, hssq, EPS, 128)
+    if const_expr(cfg.skip_idle):
+        _if_busy(
+            out, c["bid"], lambda: S.prologue_scaled(c, out, xq, xs, y2, hssq, EPS, 128)
+        )
+    else:
+        S.prologue_scaled(c, out, xq, xs, y2, hssq, EPS, 128)
     out.run(c, w, buf, part, cnt("out"), S.EpiRes(c, M, hb0, hb1, q1, hf1))
 
 
@@ -616,7 +643,14 @@ def _moe_t(
     rtr, e1, e2 = SP["router"], SP["e1"], SP["e2"]
     # S4: router logits (+ the shared-expert gate) on bf16(norm(h1))
     w, buf = barrier_then(rtr, T(T_RT), T(T_RT), e0 + 3)
-    S.prologue_norm_bf16(c, rtr, xq, red, hf1, q1, T(T_POST_LN), EPS)
+    if const_expr(cfg.skip_idle):
+        _if_busy(
+            rtr,
+            c["bid"],
+            lambda: S.prologue_norm_bf16(c, rtr, xq, red, hf1, q1, T(T_POST_LN), EPS),
+        )
+    else:
+        S.prologue_norm_bf16(c, rtr, xq, red, hf1, q1, T(T_POST_LN), EPS)
     rtr.run(
         c,
         w,
@@ -639,6 +673,13 @@ def _moe_t(
     MO.prologue_act_moe(c, e2, xq, xs, G[G_ACT], R, pos0)
     w2 = e2.setup(c, xq, xs, T(T_E2_T), T(T_E2_S))
     e2.run(c, w2, R, part, cnt("e2"), S.EpiRes(c, M, hb1, hb0, q0, hf0), pos0)
+
+
+@D.traced
+def _if_busy(spec, bid, fn):
+    """fn() (a prologue) only in CTAs that stream units of GEMV `spec`."""
+    if spec.busy(bid):
+        fn()
 
 
 def hf_ptrs(hb0, M):
