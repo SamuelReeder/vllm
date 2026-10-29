@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: E501
-# megakernels 46aa49d214ecda37714e9f9158c27c8baeaaf6ee, common/mkcore SRC_HASH 1e68a632f3838fdf
+# megakernels ba24a780b7d1c878f2300e0a5f3645e7b0d94d96 (dirty), common/mkcore SRC_HASH 078746967a20380f
 """Shared FlyDSL gfx942 megakernel infrastructure of the megakernels models
 (common/DESIGN.md). Imports no model module.
 

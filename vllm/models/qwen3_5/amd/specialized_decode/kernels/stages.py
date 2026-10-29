@@ -21,18 +21,9 @@ from vllm.models.deepseek_v41.amd.mono.common.sync import Mailbox, preg
 from . import tpdev as TD
 from .dims import VOCAB, H
 from .mkcore import dev as D
+from .mkcore.stagelib import store_quant8, zero_xs_tail
 
 NT = 512  # threads per CTA (set by the kernel builder before tracing)
-
-
-@D.traced
-def zero_xs_tail(c, g, xs):
-    """x-scale rows of tokens M..15 = 0: their MFMA rows contribute nothing."""
-    n = (16 - g.M) * g.XSR
-    for i in range_constexpr((n + NT - 1) // NT):
-        j = c["tid"] + NT * i
-        if j < n:
-            fx.ptr_store(fx.Float32(0.0), xs + (g.M * g.XSR + j))
 
 
 @D.traced
@@ -98,25 +89,6 @@ def prologue_norm(c, g, xq, xs, red, h, ssq, lnw, eps):
         store_quant8(c, g, xq, xs, x, t, sl * g.Kc + kc, tid + NT * i < nch)
     D.probe(c, 8)
     gpu.barrier()
-
-
-@D.traced
-def store_quant8(c, g, xq, xs, x, t, k0, live):
-    """8 values of token t at column k0 (16 consecutive lanes = one 128 block) ->
-    LDS fp8 + the block's pow2 scale."""
-    lane = c["lane"]
-    am = fx.Float32(0.0)
-    for e in range_constexpr(8):
-        am = fx.max(am, D.absf(x[e]))
-    am = D.xor_max(am, lane, (1, 2, 4, 8))
-    qi, sc = D.pow2_scale(fx.max(am, fx.Float32(1e-30)))
-    lo, hi = D.quant8(x, qi)
-    if live:
-        fx.ptr_store(
-            fx.Vector.from_elements([lo, hi], fx.Int32), xq + (t * g.XR + k0) // 4
-        )
-        if k0 % 128 == 0:
-            fx.ptr_store(sc, xs + (t * g.XSR + k0 // 128))
 
 
 @D.traced
@@ -413,16 +385,6 @@ def epi_act(c, M, grp, tot, act):
         up = D.gather_f(tot[r], lane + 8)  # lane col + 8 holds the up row
         if (t < M) & (col < 8):
             D.st(D.silu(tot[r]) * up, ra, t * FFN + grp * 8 + col, D.CM_DEV)
-
-
-@D.traced
-def epi_raw(c, M, N, grp, tot, out):
-    """out[:, 16 grp + col] = tot (fp32 [M][N])."""
-    ro = D.rsrc(out)
-    for r in range_constexpr(4):
-        t = 4 * c["gl"] + r
-        if t < M:
-            D.st(tot[r], ro, t * N + grp * 16 + c["col"], D.CM_DEV)
 
 
 @D.traced
