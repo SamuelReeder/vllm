@@ -260,13 +260,14 @@ def _md(decode, query_len=1):
     return {n: attn for n in decode.kernel.attn_groups}
 
 
-def test_decode_step_takes_the_kernel_up_to_width_2():
+def test_decode_step_takes_the_kernel_at_every_width():
     decode = _decode()
     with forward(decode.vllm_config, CUDAGraphMode.FULL, _md(decode)):
-        step = decode.plan(torch.zeros(2, dtype=torch.long))
-        wide = decode.plan(torch.zeros(4, dtype=torch.long))
-    assert step is not None and step.kernel_width == 2
-    assert wide is None  # batch 4 and 8: vLLM's path is as fast or faster
+        steps = {b: decode.plan(torch.zeros(b, dtype=torch.long)) for b in (1, 2, 4, 8)}
+    # the batch-4/8 expert stages beat vLLM's path at every width (megakernels
+    # gemma4-26b-a4b-gfx942/docs/DESIGN.md, "Milestone 8")
+    widths = {b: s.kernel_width if s is not None else None for b, s in steps.items()}
+    assert widths == {1: 1, 2: 2, 4: 4, 8: 8}
 
 
 def test_prefill_takes_vllm_path():
