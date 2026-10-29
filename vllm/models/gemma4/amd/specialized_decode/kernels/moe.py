@@ -88,6 +88,28 @@ class Route:
         return D.uniform(fx.ptr_load(self.eid + p))
 
 
+@D.traced
+def _lds_wait(ptr, val):
+    """Spin until the LDS word at ptr equals val (written by another wave of the CTA).
+    The inline-asm sleep is a compiler barrier: the load is not hoisted."""
+    v = fx.ptr_load(ptr)
+    while v != val:
+        D._asm("s_sleep 1")
+        v = fx.ptr_load(ptr)
+    D._asm("s_nop 0")  # (compiler barrier: later LDS loads stay after the wait)
+
+
+def run_stage(sp, *args):
+    """sp.run(*args): callable inside a run-time branch (FlyDSL carries the base object of
+    a method call written in a branch through control flow; a module function is not)."""
+    return sp.run(*args)
+
+
+def run_stage_cta(sp, *args):
+    """sp.run_cta(*args), as run_stage."""
+    return sp.run_cta(*args)
+
+
 def slot_of(slot_ptr, NP, m, p):
     """Row m's slot for position p, or -1 (a plain function: FlyDSL carries the base
     object of a method call through control flow, and Route is not an IR value)."""
@@ -98,7 +120,8 @@ def slot_of(slot_ptr, NP, m, p):
 def routing(c, M, logits, rowv, pes, R: Route):
     """Build R's tables from logits fp32 [M][LGN] (device scope), the row-valid flags
     rowv i32 [M] and the layer's per_expert_scale (bf16 [NE]). Wave m does row m; wave 0
-    builds the position list."""
+    builds the position list. Lane l loads the scales of experts 2 l, 2 l + 1 beside the
+    logits, and the picks read them from the lanes (no global load after the top-8)."""
     lane, wave, tid = c["lane"], c["wave"], c["tid"]
     NT = S.NT
     D.PROBE["on"] = D.PROBE.get("stage") == "route"
@@ -107,6 +130,7 @@ def routing(c, M, logits, rowv, pes, R: Route):
         rl = D.rsrc(logits)
         m = wave
         valid = D.uniform(D.ld(D.rsrc(rowv), m)) != 0
+        pesw = D.ld(D.rsrc(pes), fx.min(lane, NE // 2 - 1))
         v = [D.ldf(rl, m * LGN + lane + 64 * k, cm=D.CM_DEV) for k in range(NE // 64)]
         vals, picks = [], []
         for j in range_constexpr(TOPK):
@@ -131,10 +155,10 @@ def routing(c, M, logits, rowv, pes, R: Route):
         for j in range_constexpr(1, TOPK):
             tot = tot + ws[j]
         D.probe(c, 11)  # top-8 done
+        pws = [D.gather(pesw, picks[j] // 2) for j in range(TOPK)]
         if lane == 0:
-            rp = D.rsrc(pes)
             for j in range_constexpr(TOPK):
-                pw = D.ld(rp, picks[j] // 2)
+                pw = pws[j]
                 sc = (picks[j] % 2 == 0).select(D.bf_lo(pw), D.bf_hi(pw))
                 fx.ptr_store(ws[j] / tot * sc, R.w + (m * NSLOT + j))
                 fx.ptr_store(
@@ -243,6 +267,9 @@ class MoeGemv:
     mode: str  # "gu" | "down"
     waves: int = 8
     C: int = 1  # K chunks per expert
+    # down only: row-major partials, one arrival per CTA, rows reduced by reduce_row (no
+    # per-group last arriver)
+    rows: bool = False
 
     kind = "fp8"
     esize = 1
@@ -391,6 +418,19 @@ class MoeGemv:
             if const_expr(self.mode == "gu"):
                 if w["gl"] < self.MT:
                     D.st(acc, rp, (pi * 64 + w["lane"]) * 4, D.CM_DEV)
+            elif const_expr(self.rows):
+                # row-major partials [m][slot][chunk][N]: the row reducers read them
+                for r in range_constexpr(4):
+                    m = 4 * w["gl"] + r
+                    if m < self.M:
+                        j = slot_of(rslot, self.NP, m, pos)
+                        if j >= 0:
+                            D.st(
+                                acc[r],
+                                rp,
+                                self._p3(m, j, ch, g * 16 + w["col"]),
+                                D.CM_DEV,
+                            )
             else:
                 for r in range_constexpr(4):
                     m = 4 * w["gl"] + r
@@ -401,6 +441,110 @@ class MoeGemv:
             buf = nxt
         D.probe(c, 1)
         rocdl.s_waitcnt(vmcnt=0)
+        if const_expr(self.rows):
+            # all partials of the CTA are stored: one arrival per CTA on cnt (the row
+            # reducers wait for cus arrivals, reduce_row)
+            gpu.barrier()
+            if c["tid"] == 0:
+                D.atomic_add_dev(cnt, 1)
+        else:
+            self._tail_serial(w, R, rp, cnt, fin, p0, p1, npos, c)
+        D.probe(c, 2)
+
+    def _cta_q(self, t, a, ha, tb, ntail, nfull):
+        """CTA mode: the CTA-local piece of the wave's step t (order: tail, then the
+        whole groups, then the head)."""
+        return (t < ntail).select(
+            tb + t,
+            (t < ntail + nfull).select(ha + (t - ntail), a + (t - ntail - nfull)),
+        )
+
+    def _cta_load(self, w, R, g0, q):
+        gid = g0 + q // self.C
+        ub = (
+            R.eid_of(gid // self.G) * self.upe
+            + ((q % self.C) * self.G + gid % self.G) * self.KSp
+        )
+        return [fp8_load(w["rt"], w["rs"], ub + s, w["lane"]) for s in range(self.KSp)]
+
+    @D.traced
+    def run_cta(self, c, w, R, fin, pref, pflag, ep):
+        """gu, CTA mode (Cfg.e1_cta; docs/DESIGN.md "Milestone 8"). CTA b owns the column
+        groups (pos, g) b NGR / cus .. (b + 1) NGR / cus - 1 (NGR = npos G) with all C
+        chunks, in (group, chunk) order; wave wv streams the pieces wv n / 8 .. of the
+        CTA's n. A wave folds the chunks of a group in chunk order, as _reduce_gu sums
+        them (the same bits), and runs the epilogue: no partials, no counters, no last
+        arriver. A group split between waves wv and wv + 1: wave wv folds its chunks
+        0..j first and leaves the prefix in LDS (pref[wv], then pflag[wv] = ep); wave
+        wv + 1 folds the rest onto it last. A wave inside one group (no group end, a
+        "middle" wave) waits for its predecessor's prefix first, folds its pieces and
+        leaves the new prefix for its successor. Needs >= 6 pieces per wave: then no two
+        consecutive waves are middle waves, so a middle wave waits only for a prefix its
+        predecessor stores first (no chain). The caller checks npos G >= 5 cus."""
+        D.PROBE["on"] = D.PROBE.get("stage") == self.name
+        D.probe(c, 0)
+        npos = R.n()
+        C, G, KSp = self.C, self.G, self.KSp
+        NGR = npos * G
+        bid, wv, lane = c["bid"], c["wave"], w["lane"]
+        g0 = bid * NGR // self.cus
+        n = ((bid + 1) * NGR // self.cus - g0) * C
+        a = wv * n // self.waves
+        b = (wv + 1) * n // self.waves
+        mid = (a + C - 1) // C * C > b  # no group end in [a, b): all of it is head
+        ha = fx.min((a + C - 1) // C * C, b)
+        tb = fx.max(b // C * C, ha)
+        ntail = b - tb
+        nfull = tb - ha
+        L = b - a
+        hs = ntail + nfull  # the head's first step (== L: no head)
+        pub = mid.select(L - 1, ntail - 1)  # the step after which the prefix is stored
+        qs = (a, ha, tb, ntail, nfull)
+        buf = self._cta_load(w, R, g0, self._cta_q(fx.min(fx.Int32(0), L - 1), *qs))
+        r = fx.Vector.filled(4, 0.0, fx.Float32)
+        for t in range(0, L):
+            nxt = self._cta_load(w, R, g0, self._cta_q(fx.min(t + 1, L - 1), *qs))
+            q = self._cta_q(t, *qs)
+            gid = g0 + q // C
+            ch = q % C
+            pos = gid // G
+            g = gid % G
+            # dense positions read the pre_feedforward_layernorm rows M..2M-1
+            dense = pos >= npos - NDS
+            arow = dense.select(w["arow"] + self.M * self.XR, w["arow"])
+            xof = dense.select(fx.Int32(self.M * self.XSR), fx.Int32(0))
+            acc = fx.Vector.filled(4, 0.0, fx.Float32)
+            for s in range_constexpr(KSp):
+                xo = ch * KSp + s
+                acc = acc + fp8_compute(w, arow + xo * 128, xof + xo, self.XSR, buf[s])
+            if t == hs:
+                # the head continues the previous wave's tail group: its prefix
+                _lds_wait(pflag + (wv - 1), ep)
+                r = fx.Vector(
+                    fx.ptr_load(
+                        pref + ((wv - 1) * 64 + lane) * 4,
+                        result_type=fx.Vector.make_type(4, fx.Float32),
+                    )
+                )
+            first = ch == 0
+            r = fx.Vector.from_elements(
+                [first.select(acc[i], r[i] + acc[i]) for i in range(4)], fx.Float32
+            )
+            if t == pub:
+                fx.ptr_store(r, pref + (wv * 64 + lane) * 4)
+                D._asm("s_waitcnt lgkmcnt(0)")  # the prefix lands before its flag
+                if lane == 0:
+                    fx.ptr_store(ep, pflag + wv)
+            if ch == C - 1:
+                fin(pos, g, r)
+            buf = nxt
+        D.probe(c, 1)
+        D.probe(c, 2)
+
+    @D.traced
+    def _tail_serial(self, w, R, rp, cnt, fin, p0, p1, npos, c):
+        """Count the wave's pieces; each completed counter's reduction in turn."""
+        G = self.G
         olds = []
         for k in range_constexpr(self.PMAX):
             pi = p0 + k
@@ -432,7 +576,6 @@ class MoeGemv:
                         if w["lane"] == 0:
                             D.st(fx.Int32(0), D.rsrc(cnt), NSUB * G + gg, D.CM_DEV)
                         self._reduce_down(w, R, rp, gg, fin)
-        D.probe(c, 2)
 
     def _cg(self, pi):
         """Counter of piece pi. gu: (position, group), C arrivals. down: (pos % NSUB,
@@ -445,6 +588,10 @@ class MoeGemv:
 
     def _p2(self, g, j, ch, col, m):
         return (((g * NSLOT + j) * self.C + ch) * 16 + col) * 16 + m
+
+    def _p3(self, m, j, ch, n):
+        """Row-major down partial (rows mode): [m][slot j][chunk][column n]."""
+        return ((m * NSLOT + j) * self.C + ch) * self.N + n
 
     @D.traced
     def _reduce_gu(self, w, R, rp, pos, g, fin):
@@ -507,6 +654,53 @@ class MoeGemv:
             ],
             pre,
         )
+
+
+@D.traced
+def reduce_row(c, sp, m, R, part, e, ssq_e, d, ssq_d):
+    """Down stage, rows mode (Cfg.e2_rows), CTA cus - M + m once every CTA has arrived:
+    row m of e and d and their 16-column sums of squares, stored as the EpiDE epilogue
+    stores them. The arithmetic of MoeGemv._reduce_down per column (slot sums in chunk
+    order; e = the rank-order sum of w_j x slot sum over the routed slots, d = the sum of
+    the dense slots) and of stages._epi_ssq (the same 16-lane DPP butterfly): the same
+    bits. 16 lanes per group of 16 columns, 32 groups per round."""
+    tid, lane = c["tid"], c["lane"]
+    col = lane % 16
+    N = sp.N
+    rp = D.rsrc(part)
+    ro_e, rq_e, ro_d, rq_d = D.rsrc(e), D.rsrc(ssq_e), D.rsrc(d), D.rsrc(ssq_d)
+    ws = [fx.ptr_load(R.w + (m * NSLOT + j)) for j in range(TOPK)]
+    used = [fx.ptr_load(R.pick + (m * TOPK + j)) >= 0 for j in range(TOPK)]
+    RG = S.NT // 16
+    for r0 in range_constexpr((sp.G + RG - 1) // RG):
+        gi = r0 * RG + tid // 16
+        live = gi < sp.G
+        g = fx.min(gi, sp.G - 1)
+        n = g * 16 + col
+        vs = [
+            [D.ldf(rp, sp._p3(m, j, ch, n), cm=D.CM_DEV) for ch in range(sp.C)]
+            for j in range(NSLOT)
+        ]
+        te = fx.Float32(0.0)
+        td = fx.Float32(0.0)
+        for j in range_constexpr(NSLOT):
+            s = vs[j][0]
+            for ch in range_constexpr(1, sp.C):
+                s = s + vs[j][ch]
+            if const_expr(j < TOPK):
+                wj = used[j].select(ws[j], fx.Float32(0.0))
+                s = used[j].select(s, fx.Float32(0.0))
+                te = te + wj * s
+            else:
+                td = td + s
+        se = D.xor_sum(te * te, lane, (1, 2, 4, 8))
+        sd = D.xor_sum(td * td, lane, (1, 2, 4, 8))
+        if live:
+            D.st(te, ro_e, m * N + n, D.CM_DEV)
+            D.st(td, ro_d, m * N + n, D.CM_DEV)
+            if col == 0:
+                D.st(se, rq_e, m * (N // 16) + g, D.CM_DEV)
+                D.st(sd, rq_d, m * (N // 16) + g, D.CM_DEV)
 
 
 class EpiAct:

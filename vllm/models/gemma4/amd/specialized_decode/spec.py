@@ -257,12 +257,10 @@ def _refuse_caches(vllm_config, decode: "Gemma4Gfx942Decode", caches) -> list[st
 
 
 def _gemma_widths(vllm_config) -> tuple[int, ...]:
-    """The widths the kernel serves: 1 and 2. On real text in vLLM (512-token prompts,
-    MI300X) the kernel takes 3.57 / 4.20 / 5.20 / 6.94 ms per step at batch 1 / 2 / 4 /
-    8 and vLLM's own path 4.41 / 4.64 / 5.22 / 6.12 ms: no gain at 4, a loss at 8
-    (megakernels gemma4-26b-a4b-gfx942/docs/DESIGN.md, "Milestone 6"). Wider steps
-    take vLLM's path with its CUDA graphs."""
-    return tuple(w for w in _widths(vllm_config) if w <= 2)
+    """The widths the kernel serves: all (1 to 8). With the milestone-8 expert stages
+    the kernel is faster than vLLM's own path at every width on real text (megakernels
+    gemma4-26b-a4b-gfx942/docs/DESIGN.md, "Milestone 8")."""
+    return tuple(_widths(vllm_config))
 
 
 def _build(vllm_config, lm, widths: tuple[int, ...]) -> "Gemma4Gfx942Decode":
