@@ -33,8 +33,10 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from . import dev as D
+from . import tpdev as TD
 from .dims import DK, EPS, HD, NKV, NQ
+from .mkcore import dev as D
+from .mkcore.dev import bf16r, pack_bf2
 
 CH = 64  # attention positions per task
 PVB = 16  # P V: positions per load batch
@@ -53,7 +55,7 @@ def gdn_task(
     sidx[m] (0: a padding row, whose state is not written). wl: this wave's LDS (256
     floats: q[128] k[128])."""
     lane = c["lane"]
-    d = D.TRACE["d"]
+    d = TD.TRACE["d"]
     NVH, INP_N = d.nvh, d.inp_n
     Q_OFF, K_OFF, V_OFF, Z_OFF, B_OFF, A_OFF = (
         d.q_off,
@@ -202,17 +204,6 @@ def rms_rope(lane, vals, w_word, cs, rope):
     return out
 
 
-def bf16r(v):
-    """Round f32 to bf16 and back (the KV cache precision)."""
-    return fx.Float32(fx.Float32(v).to(fx.BFloat16))
-
-
-def pack_bf2(a, b):
-    return (
-        fx.Vector.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
-    )
-
-
 @D.traced
 def attn_task(
     c, task, cfg, y_qkv, qn_w, kn_w, rope_cs, kv, bt, slotp, pos_ptr, rec, cnt, og, wl
@@ -221,7 +212,7 @@ def attn_task(
     Chunk ci covers positions [p0, pe) inside KV block b = ci // cpb (see kernel.Cfg).
     Returns nothing; the last arriver of (m, j) writes og."""
     lane = c["lane"]
-    NKV = D.TRACE["d"].nkv
+    NKV = TD.TRACE["d"].nkv
     D.PROBE["on"] = D.PROBE.get("stage") == "attn"
     ncmax, cpb, B = cfg.ncmax, cfg.cpb, cfg.block
     m = task // (NKV * ncmax)
@@ -284,7 +275,7 @@ def _attn_chunk(
     Plain layout: position p's K is at base + (p - pb) kv_s2 bf16 elements, its V kv_sv
     later. x-packed layout (vLLM's ROCM_ATTN): the head's K is [HD / 8][block][8] and
     its V, kv_sv elements later, [HD][block]."""
-    d = D.TRACE["d"]
+    d = TD.TRACE["d"]
     NQ, NKV, QKV_N = d.nq, d.nkv, d.qkv_n
     ry = D.rsrc(y_qkv)
     ybase = m * QKV_N

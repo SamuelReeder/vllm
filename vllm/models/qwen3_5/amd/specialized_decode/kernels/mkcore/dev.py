@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Device-side helpers of the megakernel (FlyDSL, gfx942).
+# ruff: noqa: E501
+"""Device-side helpers of the megakernels (FlyDSL, gfx942), shared by every model
+(common/DESIGN.md D7: the union of the models' former mk/dev.py copies).
 
 Memory scopes (gfx94x CPol): CM_DEV = sc1 makes a store/load coherent across the
 XCDs (device scope). Every hand-off between CTAs uses CM_DEV on both sides.
 Spin loops contain s_sleep: a side effect that keeps LLVM from deleting the loop.
+bf16 rounding has two forms with the same results on finite inputs but different
+code: the integer round-to-nearest-even bf16_rne / pack_bf2_rne (Gemma) and the
+convert bf16r / pack_bf2 / bf16_pair (Qwen). A model keeps the one it uses (F1).
+Debug globals: PROBE, PROFILE (set by the bench scripts), FENCE and CHAOS (set from
+Cfg.fence / Cfg.chaos by configure; nothing else writes them).
 """
 
 from __future__ import annotations
@@ -14,7 +21,7 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.ast_rewriter import ASTRewriter
-from flydsl.expr import gpu, rocdl
+from flydsl.expr import const_expr, gpu, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
@@ -22,6 +29,17 @@ CM_DEV = 16
 CM_SYS = 17  # sc0 | sc1: system scope (peer GPUs over XGMI)
 CM_NT = 2
 LINE = 32  # i32 per 128 B cache line
+
+# grid of every kernel: one persistent CTA of WAVES waves per CU
+WAVES = 8
+NT = 64 * WAVES
+LDS_MAX = 65536
+_STREAM = fx.Stream(None)  # the launch's default: the current stream
+CNT_STRIDE = 65536  # i32 counters per counter region
+EPOCH_WORD_LINE = 8  # the epoch word is line cus + EPOCH_WORD_LINE of the flag buffer
+PROFILE = {
+    "addr": None
+}  # debug: i64 [barriers][CUS][2] = (arrive, wait end) per CTA, 100 MHz
 
 traced = ASTRewriter.transform
 
@@ -151,6 +169,47 @@ def xor_max(v, lane, offs):
     return _reduce(v, lane, offs, "v_max_f32", fx.max)
 
 
+def _dpp_rows(op, v, ctrl, rows):
+    """DPP op on the lanes of the rows in mask `rows` only; the other lanes keep v (the
+    output is tied to the input)."""
+    return fx.Float32(
+        llvm.InlineAsmOp(
+            T.f32,
+            [fx.Float32(v).ir_value()],
+            f"s_nop 1\n{op}_dpp $0, $1, $1 {ctrl} row_mask:{rows} bank_mask:0xf",
+            "=v,0",
+        ).result
+    )
+
+
+def _wave_uniform(v, op):
+    """Reduce v over the 64 lanes with DPP only (gfx9): the 16-lane butterfly, then
+    row_bcast:15 and row_bcast:31 carry the row results up to lane 63, which is read
+    as a wave-uniform scalar. Fixed order: ((r0 . r1) . (r2 . r3)) per lane slot."""
+    for _, ctrl in _DPP:
+        v = _dpp(op, v, ctrl)
+    v = _dpp_rows(op, v, "row_bcast:15", "0xa")
+    v = _dpp_rows(op, v, "row_bcast:31", "0xc")
+    w = llvm.call_intrinsic(
+        T.i32,
+        "llvm.amdgcn.readlane.i32",
+        [fx.Float32(v).bitcast(fx.Int32).ir_value(), fx.Int32(63).ir_value()],
+        [],
+        [],
+    )
+    return fx.Int32(w).bitcast(fx.Float32)
+
+
+def wave_max(v):
+    """Max of v over the wave, as a wave-uniform value (no LDS round trip)."""
+    return _wave_uniform(v, "v_max_f32")
+
+
+def wave_sum(v):
+    """Sum of v over the wave in a fixed order, as a wave-uniform value."""
+    return _wave_uniform(v, "v_add_f32")
+
+
 def absf(v):
     return fx.Float32(fmath.absf(v))
 
@@ -206,6 +265,44 @@ def silu(x):
     return fx.Float32(x) * sigmoid(x)
 
 
+def tanh(x):
+    """1 - 2 / (exp(2 x) + 1): +-1 at the overflow ends, absolute error about 1e-7."""
+    return fx.Float32(1.0) - fx.Float32(2.0) / (
+        expf(fx.Float32(x) * 2.0) + fx.Float32(1.0)
+    )
+
+
+def gelu_tanh(x):
+    """Gelu with the tanh approximation (HF gelu_pytorch_tanh)."""
+    x = fx.Float32(x)
+    u = x * (fx.Float32(1.0) + fx.Float32(0.044715) * x * x) * 0.7978845608028654
+    return fx.Float32(0.5) * x * (fx.Float32(1.0) + tanh(u))
+
+
+def bf16_rne(x):
+    """f32 -> bf16 bits (low 16 bits of an i32), round to nearest even, as torch and vLLM
+    round (finite inputs)."""
+    b = fx.Float32(x).bitcast(fx.Int32)
+    return ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) & 0xFFFF
+
+
+def pack_bf2_rne(a, b):
+    """Two f32 -> one i32 of two bf16 (a in the low half), round to nearest even."""
+    return bf16_rne(a) | (bf16_rne(b) << 16)
+
+
+def bf16r(v):
+    """f32 rounded to bf16 (RNE) and back (the KV cache precision)."""
+    return fx.Float32(fx.Float32(v).to(fx.BFloat16))
+
+
+def pack_bf2(a, b):
+    """Two f32 -> one i32 of two bf16 (a in the low half), by convert."""
+    return (
+        fx.Vector.from_elements([a, b], fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)[0]
+    )
+
+
 def bf16_pair(a, b):
     """Two f32 -> one f32-typed word holding (bf16(a), bf16(b)), RNE."""
     return (
@@ -213,11 +310,6 @@ def bf16_pair(a, b):
         .to(fx.BFloat16)
         .bitcast(fx.Float32)[0]
     )
-
-
-def bf16r(v):
-    """f32 rounded to bf16 (RNE) and back."""
-    return fx.Float32(fx.Float32(v).to(fx.BFloat16))
 
 
 def bf_lo(w):
@@ -264,12 +356,21 @@ def poll_ge(r, slot, val):
         v = ld(r, slot, cm=CM_DEV)
 
 
+def _asm(text):
+    llvm.InlineAsmOp(None, [], text, "", has_side_effects=True)
+
+
 @traced
-def grid_arrive(rf, epoch, tid, bid):
+def grid_arrive(rf, epoch, tid, bid, fence=False):
     """Barrier arrival: drain this CTA's memory ops (its stores become visible), then
     store epoch to the CTA's flag line. Issue prefetch loads after this, not before:
     s_waitcnt vmcnt(0) also waits for loads (measured: prefetching before the arrival
-    is slower)."""
+    is slower). fence: also write back this XCD's dirty L2 lines first (agent-scope
+    release, buffer_wbl2 sc1)."""
+    if const_expr(CHAOS["on"]):
+        chaos_sleep(bid)
+    if const_expr(fence):
+        _asm("buffer_wbl2 sc1")
     rocdl.s_waitcnt(vmcnt=0)
     gpu.barrier()
     if tid == 0:
@@ -277,10 +378,13 @@ def grid_arrive(rf, epoch, tid, bid):
 
 
 @traced
-def grid_wait(rf, epoch, tid, bid, cus):
+def grid_wait(rf, epoch, tid, bid, cus, fence=False):
     """Barrier completion. Leader x < 8 waits for the CTAs b % 8 == x (its XCD under
     round-robin dispatch) and stores epoch to line cus + x; every CTA waits for the
-    8 leader lines. Epochs only grow."""
+    8 leader lines. Epochs only grow. fence: then invalidate this XCD's non-local L2
+    lines and the CU's L1 (agent-scope acquire, buffer_inv sc1). (One-hop variants,
+    device-scope arrival counters and a dense flag array polled by every CTA, were
+    slower: docs/DESIGN.md, "Fixed stage cost".)"""
     if bid < 8:
         nx = (cus - bid + 7) // 8
         if tid < nx:
@@ -291,11 +395,36 @@ def grid_wait(rf, epoch, tid, bid, cus):
     if tid < 8:
         poll_ge(rf, (cus + tid) * LINE, epoch)
     gpu.barrier()
+    if const_expr(fence):
+        _asm("buffer_inv sc1")
+        rocdl.s_waitcnt(vmcnt=0)
 
 
-def grid_barrier(rf, epoch, tid, bid, cus):
-    grid_arrive(rf, epoch, tid, bid)
-    grid_wait(rf, epoch, tid, bid, cus)
+FENCE = {"on": False}  # debug (Cfg.fence): agent-scope release / acquire around atomics
+CHAOS = {
+    "on": False
+}  # debug (Cfg.chaos): random 0..7 us delays before arrivals and atomics
+
+
+def configure(cfg) -> None:
+    """Set the debug globals that mkcore code reads from the Cfg being built (at the start
+    of build, before tracing): FENCE from cfg.fence, CHAOS from cfg.chaos."""
+    FENCE["on"] = cfg.fence
+    CHAOS["on"] = cfg.chaos
+
+
+@traced
+def chaos_sleep(salt):
+    """Debug: sleep 0..7 x s_sleep(31) (about 1 us each), drawn from the clock and
+    `salt`. Changes the arrival order at barriers and counters from run to run; the
+    results must not change (P1, P2)."""
+    x = (fx.Int32(memrealtime()) ^ (fx.Int32(salt) * fx.Int32(-1640531535))) * fx.Int32(
+        -2048144789
+    )
+    n = (x >> 28) & 7
+    while n > 0:
+        rocdl.s_sleep(31)
+        n = n - 1
 
 
 def atomic_add_dev(addr, v):
@@ -305,8 +434,13 @@ def atomic_add_dev(addr, v):
     (buffer_wbl2) and invalidate (buffer_inv) the whole L2, which stalls the weight
     stream for tens of us. Ordering comes from the protocol instead: the payload is
     stored with sc1 and drained (s_waitcnt vmcnt(0)) before the atomic, and readers
-    load it with sc1."""
-    return fx.Int32(
+    load it with sc1. FENCE["on"] adds the explicit release / acquire (debug)."""
+    if const_expr(CHAOS["on"]):
+        chaos_sleep(0)
+    if FENCE["on"]:
+        _asm("buffer_wbl2 sc1")
+        rocdl.s_waitcnt(vmcnt=0)
+    old = fx.Int32(
         fx.atomic_add(
             gptr(addr),
             fx.Int32(v),
@@ -314,46 +448,13 @@ def atomic_add_dev(addr, v):
             ordering=fx.AtomicOrdering.Monotonic,
         )
     )
+    if FENCE["on"]:
+        rocdl.s_waitcnt(vmcnt=0)
+        _asm("buffer_inv sc1")
+    return old
 
-
-# Trace-time constants of the kernel being traced (kernel.build's launch sets them
-# before its body traces): "d" the rank's Dims, "ar" the all-reduce config or None.
-# Python values cannot ride in the stage dict c, which the layer loop carries as IR.
-TRACE = {}
 
 PROBE = {"addr": None}  # debug: global address of an i64 array [CTA * 8 + wave][16]
-
-# debug (TP > 1): all-reduce timing split, docs/DESIGN-TP2.md section 11. "bar": i64
-# [barrier][CUS][4] = (arrive, drained, released, 0) per CTA, where "drained" is after
-# the CTA's s_waitcnt vmcnt(0) (its peer stores acknowledged). "wave": i64
-# [barrier][CUS * 8 + wave][4] = (push, poll start, poll end, group) of the last
-# all-reduce epilogue the wave ran in the stage that starts at that barrier.
-ARPROBE = {"bar": None, "wave": None}
-
-
-def drain_cta():
-    """Wait for every memory op of every wave of the CTA (the s_waitcnt of grid_arrive,
-    taken earlier so a stamp can follow it)."""
-    rocdl.s_waitcnt(vmcnt=0)
-    gpu.barrier()
-
-
-def st_stamps(addr, i, a, b):
-    """Store the i64 pair (a, b) at i64 index i of addr."""
-    a, b = fx.Int64(a), fx.Int64(b)
-    st(
-        fx.Vector.from_elements(
-            [
-                fx.Int32(a & 0xFFFFFFFF),
-                fx.Int32(a >> 32),
-                fx.Int32(b & 0xFFFFFFFF),
-                fx.Int32(b >> 32),
-            ],
-            fx.Int32,
-        ),
-        rsrc(addr),
-        i * 2,
-    )
 
 
 def probe(c, slot):

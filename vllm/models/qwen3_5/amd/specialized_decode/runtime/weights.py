@@ -9,7 +9,7 @@ Per layer the kernel streams four GEMVs (N x K at TP 1):
               o    = o_proj                           (5120 x 6144)
   every layer gu   = gate_up_proj, rows interleaved per 8 columns
               down = down_proj                        (5120 x 17408)
-Each is re-tiled for the gfx942 FP8 MFMA (kernels/fp4.py) and stored in the order the
+Each is re-tiled for the gfx942 FP8 MFMA (mkcore/fp4.py) and stored in the order the
 waves stream it. vLLM keeps its own tensors for the prefill path, so the copies add the
 linear weights once more (12.9 GB at TP 1, half of it per rank at TP 2). The embedding
 table, the final norm and the small per-layer tensors are read in place.
@@ -23,9 +23,10 @@ b | a, qkv_proj: q and gate | k | v, gate_up_proj: gate | up), row-parallel laye
 
 import torch
 
-from ..kernels import fp4
 from ..kernels.dims import DV, HD, NL, Dims, H, is_attn
-from ..kernels.gemv import PAD_TILES, chunks
+from ..kernels.kernel import chunks
+from ..kernels.mkcore import fp4
+from ..kernels.mkcore.pack import gu_order, unit_order
 from ..spec import GEMVS, mxfp4_parts
 
 SMALL = {
@@ -65,29 +66,6 @@ def small_rows(d: Dims) -> dict[str, int]:
     }
 
 
-def gu_order(t: torch.Tensor) -> torch.Tensor:
-    """[gate; up] rows -> per 8 columns c: gate rows 8 c .. 8 c + 7, then up rows 8 c ..
-    8 c + 7, so one 16-row group of the GEMV yields 8 complete act columns."""
-    n = t.shape[0] // 2
-    g = t[:n].reshape(n // 8, 8, -1)
-    u = t[n:].reshape(n // 8, 8, -1)
-    return torch.cat([g, u], 1).reshape(2 * n, -1)
-
-
-def unit_order(t: torch.Tensor, C: int) -> torch.Tensor:
-    """[G, KS, ...] per-(group, superstep) tiles -> the GEMV stream's unit order
-    (chunk, group, superstep), flat [C G KSc, ...], plus PAD_TILES zero tiles (loads
-    run ahead)."""
-    G, KS = t.shape[:2]
-    u = (
-        t.reshape(G, C, KS // C, *t.shape[2:])
-        .transpose(0, 1)
-        .reshape(G * KS, *t.shape[2:])
-    )
-    pad = torch.zeros(PAD_TILES, *t.shape[2:], dtype=t.dtype, device=t.device)
-    return torch.cat([u, pad]).contiguous()
-
-
 class PackedWeights:
     """The kernel's weights of one TP rank: packed GEMV tiles per (layer, GEMV) and the
     in-place small tensors per (layer, name)."""
@@ -95,7 +73,7 @@ class PackedWeights:
     def __init__(self, layers, tp: int = 1):
         d = Dims(tp)
         shapes, rows = gemv_shapes(d), small_rows(d)
-        self.chunks: tuple = ()  # Cfg.chunks: no override of gemv.chunks(tp)
+        self.chunks: tuple = ()  # Cfg.chunks: no override of kernel.chunks(tp)
         C_of = chunks(tp, self.chunks)
         self.mats: dict[tuple[int, str], tuple[torch.Tensor, torch.Tensor]] = {}
         self.small: dict[tuple[int, str], torch.Tensor] = {}
@@ -115,7 +93,10 @@ class PackedWeights:
                         w, s = gu_order(w), gu_order(s)
                     tiles, scales = fp4.repack(w, s)
                     C = C_of.get(name, 1)
-                    self.mats[(i, name)] = (unit_order(tiles, C), unit_order(scales, C))
+                    self.mats[(i, name)] = (
+                        unit_order(tiles, 2, C),
+                        unit_order(scales, 1, C),
+                    )
             names = (
                 "input_layernorm.weight",
                 "post_attention_layernorm.weight",

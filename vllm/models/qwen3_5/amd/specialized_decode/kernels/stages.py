@@ -18,8 +18,9 @@ from flydsl.expr.typing import T
 
 from vllm.models.deepseek_v41.amd.mono.common.sync import Mailbox, preg
 
-from . import dev as D
+from . import tpdev as TD
 from .dims import VOCAB, H
+from .mkcore import dev as D
 
 NT = 512  # threads per CTA (set by the kernel builder before tracing)
 
@@ -164,10 +165,10 @@ class EpiRes:
             ssq_out,
             hb_out,
         )
-        self.ar = ar if D.TRACE["ar"] is not None else None
+        self.ar = ar if TD.TRACE["ar"] is not None else None
         # deferred poll: the GEMV pushes every group it completes first (push), then
         # polls and stores them (finish), so the round trips of a wave's groups overlap
-        self.deferred = self.ar is not None and not D.TRACE["ar"]["local"]
+        self.deferred = self.ar is not None and not TD.TRACE["ar"]["local"]
 
     def pre(self, grp):
         ri = D.rsrc(self.h_in)
@@ -196,7 +197,7 @@ class EpiRes:
 
 
 def _ar_ctx(c, grp, tag, half):
-    A = dict(D.TRACE["ar"], **c["ar"])
+    A = dict(TD.TRACE["ar"], **c["ar"])
     off = fx.Int64(half * A["region"])
     dst = [preg(A["bases"][p] + off, 0, "ar") for p in range(A["tp"])]
     own = preg(A["own"] + off, 0, "ar")
@@ -214,7 +215,7 @@ def ar_push(c, M, grp, tot, tag, half):
     tp, rank, lane, col = A["tp"], A["rank"], c["lane"], c["col"]
     tv = [fx.Float32(tot[r]) for r in range(4)]
     tag = fx.Int32(tag)
-    apw = D.ARPROBE["wave"]
+    apw = TD.ARPROBE["wave"]
     if const_expr(apw is not None):
         t_push = D.memrealtime()
     if const_expr(A["dtype"] == "fp32"):
@@ -252,7 +253,7 @@ def ar_poll(c, M, grp, tag, half):
     A, dst, own, rows, n, k = _ar_ctx(c, grp, tag, half)
     tp, lane, col = A["tp"], c["lane"], c["col"]
     mb = Mailbox(fx.Int32(tag))
-    apw = D.ARPROBE["wave"]
+    apw = TD.ARPROBE["wave"]
     fp = A["dtype"] == "fp32"
     W = H if fp else H // 2
     even = col % 2 == 0
@@ -301,7 +302,7 @@ def _stamps(apw, lane, pairs):
     """Debug (dev.ARPROBE): lane 0 stores the i64 pairs (index, a, b) of a wave."""
     if lane == 0:
         for i, a, b in pairs:
-            D.st_stamps(fx.Int64(apw), i, a, b)
+            TD.st_stamps(fx.Int64(apw), i, a, b)
 
 
 @D.traced
@@ -309,7 +310,7 @@ def ar_local(c, M, grp, tot, tag, half):
     """Timing-only stand-in of the all-reduce (Cfg.ar_local): the own partial added
     twice, no peer traffic, the same probe stamps as ar_push / ar_poll."""
     A, _, _, _, _, k = _ar_ctx(c, grp, tag, half)
-    apw = D.ARPROBE["wave"]
+    apw = TD.ARPROBE["wave"]
     if const_expr(apw is not None):
         t_push = D.memrealtime()
     out = []
@@ -365,7 +366,7 @@ class EpiConv:
         return out
 
     def pre(self, grp):
-        CONV_DIM = D.TRACE["d"].conv_dim
+        CONV_DIM = TD.TRACE["d"].conv_dim
         n = fx.min(grp * 16 + self.c["col"], CONV_DIM - 1)
         rows = self.rows()
         st = []
@@ -380,7 +381,7 @@ class EpiConv:
 
 @D.traced
 def _epi_conv(c, M, grp, tot, pre, y):
-    CONV_DIM, INP_N = D.TRACE["d"].conv_dim, D.TRACE["d"].inp_n
+    CONV_DIM, INP_N = TD.TRACE["d"].conv_dim, TD.TRACE["d"].inp_n
     rows, st, wv = pre
     col = c["col"]
     n = grp * 16 + col
@@ -405,7 +406,7 @@ def epi_act(c, M, grp, tot, act):
     """gate_up epilogue: group grp = gate rows then up rows of act columns 8 grp .. + 7
     (pack.gu_order): act[:, 8 grp + col] = silu(gate) * up for lanes col < 8."""
     col, lane = c["col"], c["lane"]
-    FFN = D.TRACE["d"].ffn
+    FFN = TD.TRACE["d"].ffn
     ra = D.rsrc(act)
     for r in range_constexpr(4):
         t = 4 * c["gl"] + r
@@ -534,7 +535,7 @@ def embed_stage(c, M, tok_ptr, emb, h_out, ssq_out, hb_out, tag):
     the owner's slot: the exact row, as at TP 1 (docs/DESIGN-TP2.md section 5)."""
     tid, bid = c["tid"], c["bid"]
     lane = c["lane"]
-    d = D.TRACE["d"]
+    d = TD.TRACE["d"]
     ng = H // 16
     t = tid // 16
     col = tid % 16
@@ -545,7 +546,7 @@ def embed_stage(c, M, tok_ptr, emb, h_out, ssq_out, hb_out, tag):
         ro, rq = D.rsrc(h_out), D.rsrc(ssq_out)
         row = tok
         owner = fx.Int32(0)
-        if const_expr(D.TRACE["ar"] is not None):
+        if const_expr(TD.TRACE["ar"] is not None):
             owner = tok // d.vocab
             row = tok - owner * d.vocab
         re = D.rsrc(
@@ -559,7 +560,7 @@ def embed_stage(c, M, tok_ptr, emb, h_out, ssq_out, hb_out, tag):
             # the layers, the ranks do not keep in step, and the one embedding region
             # would be overwritten before it is read. The non-owner rank then reads a
             # wrong row.
-            if const_expr(D.TRACE["ar"] is not None and not D.TRACE["ar"]["local"]):
+            if const_expr(TD.TRACE["ar"] is not None and not TD.TRACE["ar"]["local"]):
                 v = _embed_exchange(c, M, tag, owner, t, k, v)
             D.st(v, ro, t * H + k, D.CM_DEV)
             D.st(fx.Float32(v).to(fx.BFloat16), D.rsrc(hb_out), t * H + k, D.CM_DEV)
@@ -572,7 +573,7 @@ def embed_stage(c, M, tok_ptr, emb, h_out, ssq_out, hb_out, tag):
 def _embed_exchange(c, M, tag, owner, t, k, v):
     """The owner rank puts its row value v to every rank's embedding region; every
     rank returns the owner's value from its own region."""
-    A = dict(D.TRACE["ar"], **c["ar"])
+    A = dict(TD.TRACE["ar"], **c["ar"])
     off = fx.Int64(2 * A["region"])
     mb = Mailbox(tag)
     if owner == A["rank"]:

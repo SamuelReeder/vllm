@@ -32,7 +32,7 @@ launch has no per-step host argument and can be captured in a CUDA graph.
 """
 
 import functools
-import zlib
+import pathlib
 from dataclasses import dataclass
 
 import flydsl.compiler as flyc
@@ -40,16 +40,28 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import Int32, Int64
 
-from . import dev as D
 from . import mixer as X
 from . import stages as S
+from . import tpdev as TD
 from .dims import EPS, HD, Dims, H
-from .gemv import Gemv, chunks
+from .mkcore import dev as D
+from .mkcore import key as K
+from .mkcore.dev import _STREAM, CNT_STRIDE, EPOCH_WORD_LINE, NT, PROFILE, WAVES
+from .mkcore.gemv import Gemv
+
+# K chunks of the GEMVs (default 1); the packer follows. chunks() gives a TP size's
+# table, with an optional override ((name, C), ...): Cfg.chunks carries it, so it is in
+# the kernel name.
+CHUNKS = dict(out=2, o=2, down=4, lm=8)
+CHUNKS_TP = {1: CHUNKS, 2: CHUNKS}
+
+
+def chunks(tp=1, override=()):
+    return dict(CHUNKS_TP[tp], **dict(override))
+
 
 NTAB = 18  # pointer-table slots per layer
 NGLOB = 18  # global pointer-table slots
-WAVES = 8
-NT = 64 * WAVES
 
 # global table slots
 (
@@ -91,10 +103,6 @@ T_QN, T_KN, T_KV = range(10, 13)  # attention layers
 # sidx[M]; an attention layer's block table bt[M][maxblocks] and slot mapping slot[M].
 T_IDX, T_SLOT = 16, 17
 
-_STREAM = fx.Stream(None)  # the launch's default: the current stream
-CNT_STRIDE = 65536  # i32 counters per counter region
-EPOCH_WORD_LINE = 8  # the epoch word is line cus + EPOCH_WORD_LINE of the flag buffer
-
 
 @dataclass(frozen=True)
 class Cfg:
@@ -117,6 +125,9 @@ class Cfg:
     ar_dtype: str = "fp32"  # all-reduce partials: "fp32" pairs or "bf16" pair words
     ar_local: bool = False  # debug timing only: add the own partial twice, no peer
     chunks: tuple = ()  # ((gemv name, K chunks), ...) over gemv.chunks(tp); Packed's
+    # .chunks: the weights are packed for these counts, so the two must match
+    fence: bool = False  # mkcore.key.COMMON_FIELDS; no barrier code reads it yet (M4)
+    chaos: bool = False  # mkcore.key.COMMON_FIELDS; no barrier code reads it yet (M4)
 
     @property
     def d(self):
@@ -175,13 +186,10 @@ def peer_bytes(tp):
 CNT_REGION = dict(inp=0, out=1, qkv=2, o=3, gu=4, down=5, lm=6, attn=7)
 
 
-PROFILE = {
-    "addr": None
-}  # debug: i64 [barriers][CUS][2] = (arrive, wait end) per CTA, 100 MHz
-
-
 def build(cfg: Cfg):
     M, CUS, d = cfg.M, cfg.cus, cfg.d
+    K.check_cfg(cfg)
+    D.configure(cfg)
     assert 1 <= M <= WAVES, "the norm prologues give each row one wave"
     assert cfg.ar_dtype in ("fp32", "bf16") and M <= AR_MMAX
     TP = cfg.tp
@@ -223,9 +231,12 @@ def build(cfg: Cfg):
         v = D.ld(r, 2 * i, 2)
         return (fx.Int64(D.uniform(v[1])) << 32) | fx.Int64(fx.Uint32(D.uniform(v[0])))
 
-    # FlyDSL's disk cache keys on the name, the source and scalar closure values, not
-    # on cfg's fields: every field goes into the name, or two geometries share a binary
-    name = f"qwen38_decode_m{M}_{zlib.crc32(repr(cfg).encode()):08x}"
+    # the kernel name is not in FlyDSL's disk-cache key; `key` is (mkcore.key).
+    # The debug globals change the traced code, so they go into the key too.
+    key = K.compile_key(
+        cfg, pathlib.Path(__file__).resolve().parent, PROFILE, D.PROBE, TD.ARPROBE
+    )
+    name = K.kernel_name("qwen38_decode", cfg, key)
 
     @flyc.kernel(name=name, known_block_size=[NT, 1, 1])
     def kdec(tab: Int64, glob: Int64, nlayers: Int32):
@@ -301,10 +312,10 @@ def build(cfg: Cfg):
             if const_expr(PROFILE["addr"] is not None):
                 slot = ((e - epoch - 1) * CUS + bid) * 2
                 stamp(slot)
-            apb = D.ARPROBE["bar"]
+            apb = TD.ARPROBE["bar"]
             if const_expr(apb is not None):
                 t_arr = D.memrealtime()
-                D.drain_cta()
+                TD.drain_cta()
                 t_drn = D.memrealtime()
             D.grid_arrive(rf, e, tid, bid)
             buf = spec.first_loads(w) if spec is not None else None
@@ -315,8 +326,8 @@ def build(cfg: Cfg):
                 t_rel = D.memrealtime()
                 k = ((e - epoch - 1) * CUS + bid) * 4
                 if tid == 0:
-                    D.st_stamps(fx.Int64(apb), k, t_arr, t_drn)
-                    D.st_stamps(fx.Int64(apb), k + 2, t_rel, fx.Int64(0))
+                    TD.st_stamps(fx.Int64(apb), k, t_arr, t_drn)
+                    TD.st_stamps(fx.Int64(apb), k + 2, t_rel, fx.Int64(0))
             return w, buf
 
         # ---- embedding (+ zero the attention counters: their totals change with pos)
@@ -436,8 +447,9 @@ def build(cfg: Cfg):
 
     @flyc.jit
     def launch(tab: Int64, glob: Int64, nlayers: Int32, stream: fx.Stream = _STREAM):
-        D.TRACE.clear()
-        D.TRACE.update(d=d, ar=AR)
+        key  # noqa: B018  a str closure value: FlyDSL puts it in the disk-cache key
+        TD.TRACE.clear()
+        TD.TRACE.update(d=d, ar=AR)
         kdec(tab, glob, nlayers).launch(grid=(CUS,), block=(NT,), stream=stream)
 
     return launch
@@ -542,7 +554,7 @@ def _attn_layer(
         buf,
         part,
         cnt("qkv"),
-        lambda cg, tots: S.epi_raw(c, M, D.TRACE["d"].qkv_n, cg, tots[0], y),
+        lambda cg, tots: S.epi_raw(c, M, TD.TRACE["d"].qkv_n, cg, tots[0], y),
     )
     barrier_then(None, None, None, e0 + 1)
     for t in range(gw, ntask, c["cus"] * WAVES):
