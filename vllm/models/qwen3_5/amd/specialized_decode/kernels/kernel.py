@@ -31,6 +31,7 @@ The barrier epoch lives on the device (word EPOCH_WORD of the flag buffer), so a
 launch has no per-step host argument and can be captured in a CUDA graph.
 """
 
+import dataclasses
 import functools
 import pathlib
 from dataclasses import dataclass
@@ -85,6 +86,10 @@ NGLOB = 18  # global pointer-table slots
     G_PEERS,  # TP: int64 [tp] every rank's peer buffer (PeerBuffer.addresses)
     G_RANK,  # TP: this rank (an integer, not a pointer)
 ) = range(18)
+# Cfg.rt_geom 2: glob slot G_GEOM (after the slots above) holds the run-time cache
+# geometry, the i32 words of mixer.GEO (Cfg.geom_slots); the attention stage loads it
+G_GEOM = NGLOB
+NGEO = 1
 # per-layer slots
 (
     T_MIX_T,
@@ -129,6 +134,29 @@ class Cfg:
     # .chunks: the weights are packed for these counts, so the two must match
     fence: bool = False  # mkcore.key.COMMON_FIELDS; no barrier code reads it yet (M4)
     chaos: bool = False  # mkcore.key.COMMON_FIELDS; no barrier code reads it yet (M4)
+    rt_geom: int | None = None  # 2: maxlen and maxblocks are run-time values (glob slot
+    # G_GEOM, geom_slots), so one build serves every max_model_len; 0: compiled in.
+    # None: 2 at tp 1, 0 at tp 2 (rt_geom 2 is not yet checked at TP2; DESIGN.md)
+
+    def __post_init__(self):
+        if self.rt_geom is None:
+            object.__setattr__(self, "rt_geom", 2 if self.tp == 1 else 0)
+
+    def compiled(self):
+        """The Cfg the kernel is built for: rt_geom zeroes its run-time fields
+        (mixer.RT_FIELDS), so one build (one key, one name) serves every geometry that
+        differs in them only."""
+        assert self.rt_geom in (0, 2), self.rt_geom
+        if not self.rt_geom:
+            return self
+        return dataclasses.replace(self, **{f: 0 for f in X.RT_FIELDS})
+
+    def geom_slots(self):
+        """The NGEO int64 glob slots from G_GEOM: the i32 words of mixer.GEO, two a
+        slot (low word first)."""
+        w = [getattr(self, n) for n in X.GEO]
+        assert len(w) == 2 * NGEO and all(0 <= v < 2**31 for v in w), w
+        return [w[2 * k] | w[2 * k + 1] << 32 for k in range(NGEO)]
 
     @property
     def d(self):
@@ -188,6 +216,7 @@ CNT_REGION = dict(inp=0, out=1, qkv=2, o=3, gu=4, down=5, lm=6, attn=7)
 
 
 def build(cfg: Cfg):
+    cfg = cfg.compiled()
     M, CUS, d = cfg.M, cfg.cus, cfg.d
     K.check_cfg(cfg)
     D.configure(cfg)
@@ -208,7 +237,6 @@ def build(cfg: Cfg):
     XSF = 16 * max(s.XSR for s in SP.values())
     ATT_W = X.GQ * HD + HD  # floats per wave (q / p, then k_new v_new bf16 pairs)
     NTASK_G = M * d.nvh * 8
-    NTASK_A = M * d.nkv * cfg.ncmax
 
     @fx.struct
     class GemvLds:
@@ -263,6 +291,7 @@ def build(cfg: Cfg):
         rg = D.rsrc(glob)
         rt = D.rsrc(tab)
         G = [tab64(rg, k) for k in range(NGLOB)]
+        geo = X.Geo(cfg, rg, 2 * G_GEOM)
         rf = D.rsrc(G[G_FLAGS])
         # every CTA reads the epoch before its first arrival; CTA 0 advances it after
         # the last barrier, which no CTA passes before all have read it
@@ -295,8 +324,9 @@ def build(cfg: Cfg):
                     slot * 2,
                 )
 
-        def barrier_then(spec, tiles, scales, e):
-            """Arrive, prefetch the GEMV's first units, wait."""
+        def barrier_then(spec, tiles, scales, e, pre=None):
+            """Arrive, prefetch the GEMV's first units (or call pre: a stage without a
+            GEMV loads its run-time geometry there), wait."""
             w = None
             if const_expr(spec is not None):
                 # opaque ids: keep the stage's address math inside the stage
@@ -319,7 +349,8 @@ def build(cfg: Cfg):
                 TD.drain_cta()
                 t_drn = D.memrealtime()
             D.grid_arrive(rf, e, tid, bid)
-            buf = spec.first_loads(w) if spec is not None else None
+            pre_buf = pre() if pre is not None else None
+            buf = spec.first_loads(w) if spec is not None else pre_buf
             D.grid_wait(rf, e, tid, bid, CUS)
             if const_expr(PROFILE["addr"] is not None):
                 stamp(slot + 1)
@@ -379,8 +410,7 @@ def build(cfg: Cfg):
                     cnt,
                     barrier_then,
                     gw_l,
-                    NTASK_A,
-                    cfg,
+                    geo,
                 )
             else:
                 _gdn_layer(
@@ -540,8 +570,7 @@ def _attn_layer(
     cnt,
     barrier_then,
     gw,
-    ntask,
-    cfg,
+    geo,
 ):
     M = c_M(SP)
     hf0, hf1 = hf_ptrs(hb0, M)
@@ -557,12 +586,13 @@ def _attn_layer(
         cnt("qkv"),
         lambda cg, tots: SL.epi_raw(c, M, TD.TRACE["d"].qkv_n, cg, tots[0], y, None),
     )
-    barrier_then(None, None, None, e0 + 1)
+    _, g = barrier_then(None, None, None, e0 + 1, pre=geo.attn)
+    ntask = M * TD.TRACE["d"].nkv * g["ncmax"]
     for t in range(gw, ntask, c["cus"] * WAVES):
         X.attn_task(
             c,
             t,
-            cfg,
+            g,
             y,
             T(T_QN),
             T(T_KN),
