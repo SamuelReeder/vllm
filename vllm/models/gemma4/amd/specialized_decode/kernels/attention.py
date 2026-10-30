@@ -44,7 +44,8 @@ NEG = -3.0e38
 
 @dataclass(frozen=True)
 class Geo:
-    """One layer type's attention geometry and its cache layout (compile-time)."""
+    """One layer type's attention geometry and its cache layout (compile-time; with
+    kernel.Cfg.rt_geom, NC of full layers and maxblocks are run-time i32 values)."""
 
     full: bool
     NC: int  # chunk slots per (row, kv head, group)

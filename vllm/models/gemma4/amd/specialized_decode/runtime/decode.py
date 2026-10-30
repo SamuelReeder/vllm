@@ -190,7 +190,10 @@ class Gemma4Gfx942Decode:
         self.bt = [zi(Mx, mbf if f else mbs) for f in full_of]
         self.slot = zi(len(self.attn_groups), Mx)
         m, W = self.model, self.weights
-        g = [0] * KK.NGLOB  # G_LM and G_SPARE: the LM head and debug_route only
+        # G_LM and G_SPARE: the LM head and debug_route only
+        g = [0] * (KK.NGLOB + KK.NGEO)
+        # the run-time cache geometry (Cfg.rt_geom): the same for every width
+        g[KK.G_GEOM :] = cfg.geom_slots()
         g[KK.G_EMBED] = m.embed_tokens.weight.data_ptr()
         g[KK.G_FNORM] = m.norm.weight.data_ptr()
         g[KK.G_ROPE_S] = self.rope_s.data_ptr()

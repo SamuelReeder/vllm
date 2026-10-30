@@ -32,6 +32,7 @@ mkcore.key.compile_key (the Cfg, the debug globals, the sources of mk/ and mkcor
 the launcher holds; the kernel name holds a hash of that key.
 """
 
+import dataclasses
 import functools
 import pathlib
 from dataclasses import asdict, dataclass
@@ -111,6 +112,15 @@ NGLOB = 32  # global pointer-table slots
     G_XQ,
     G_XQS,
 ) = range(NGLOB)
+# Cfg.rt_geom 2: glob slot G_GEOM (after the slots above) holds the run-time cache
+# geometry, the i32 words GEO (Cfg.geom_slots, then a pad word); the attention stages
+# load them. Run-time: what follows from maxlen (both layer types' block-table columns,
+# the full layers' chunk slots); the window, block sizes and strides, and so the sliding
+# layers' chunk slots, stay compiled in
+G_GEOM = NGLOB
+NGEO = 2
+RT_FIELDS = ("maxlen", "maxblocks_s", "maxblocks_f")  # Cfg fields not compiled in
+GEO = ((False, "maxblocks"), (True, "NC"), (True, "maxblocks"))  # (Geo.full, Geo field)
 # per-row slots (row i + 1 = layer i)
 (
     T_QKV_T,
@@ -185,6 +195,25 @@ class Cfg:
     debug_route: bool = False  # store a hash of every CTA's routing tables (I5)
     fence: bool = False  # L2 write-back / invalidate at every grid barrier (dev.grid_*)
     chaos: bool = False  # mkcore.key.COMMON_FIELDS; no barrier code reads it yet (M4)
+    rt_geom: int = 0  # 2: maxlen and maxblocks_* are run-time values (glob slot G_GEOM,
+    # geom_slots), so one build serves every max_model_len; 0: compiled in. Default 0:
+    # rt2 TPOT +1.81 % at M=1 on MI325X (bench/results/rt2/ab_m1.txt), over the 1 % limit
+
+    def compiled(self):
+        """The Cfg the kernel is built for: rt_geom zeroes its run-time fields
+        (RT_FIELDS), so one build (one key, one name) serves every geometry that differs
+        in them only."""
+        assert self.rt_geom in (0, 2), self.rt_geom
+        if not self.rt_geom:
+            return self
+        return dataclasses.replace(self, **{f: 0 for f in RT_FIELDS})
+
+    def geom_slots(self):
+        """The NGEO int64 glob slots from G_GEOM: the i32 words of GEO and a 0 pad, two a
+        slot (low word first)."""
+        w = [getattr(self.geo(f), n) for f, n in GEO] + [0]
+        assert len(w) == 2 * NGEO and all(0 <= v < 2**31 for v in w), w
+        return [w[2 * k] | w[2 * k + 1] << 32 for k in range(NGEO)]
 
     def __post_init__(self):
         if self.e1_cta is None:
@@ -261,6 +290,7 @@ def pref_floats(cfg: Cfg):
 
 
 def build(cfg: Cfg):
+    cfg = cfg.compiled()
     M, CUS = cfg.M, cfg.cus
     K.check_cfg(cfg)
     assert 1 <= M <= WAVES, "the routing and the rstd reductions give each row one wave"
@@ -268,7 +298,22 @@ def build(cfg: Cfg):
         "e2_rows: the combine CTAs reduce the rows"
     )
     SP = cfg.specs()
-    GEO = {False: cfg.geo(False), True: cfg.geo(True)}
+
+    def ld_geo(rg, full):
+        """Layer type full's attention geometry; with cfg.rt_geom its GEO words are loaded
+        from glob rg (call it in the scope that uses them)."""
+        geo = cfg.geo(full)
+        if not cfg.rt_geom:
+            return geo
+        return dataclasses.replace(
+            geo,
+            **{
+                n: D.uniform(D.ld(rg, 2 * G_GEOM + k))
+                for k, (f, n) in enumerate(GEO)
+                if f == full
+            },
+        )
+
     D.configure(cfg)
     S.NT = NT
     XQB, XSF, AW, NP, lds = lds_bytes(cfg)
@@ -366,8 +411,9 @@ def build(cfg: Cfg):
                     slot * 2,
                 )
 
-        def barrier_then(spec, tiles, scales, e):
-            """Arrive, prefetch the GEMV's first units, wait."""
+        def barrier_then(spec, tiles, scales, e, pre=None):
+            """Arrive, prefetch the GEMV's first units (or call pre: a stage without a
+            GEMV loads its run-time geometry there), wait."""
             w = None
             if const_expr(spec is not None):
                 # opaque ids: keep the stage's address math inside the stage
@@ -385,7 +431,8 @@ def build(cfg: Cfg):
                 slot = ((e - epoch - 1) * CUS + bid) * 2
                 stamp(slot)
             D.grid_arrive(rf, e, tid, bid, cfg.fence)
-            buf = spec.first_loads(w) if spec is not None else None
+            pre_buf = pre() if pre is not None else None
+            buf = spec.first_loads(w) if spec is not None else pre_buf
             D.grid_wait(rf, e, tid, bid, CUS, cfg.fence)
             if const_expr(PROFILE["addr"] is not None):
                 stamp(slot + 1)
@@ -448,9 +495,9 @@ def build(cfg: Cfg):
                 li=i,
             )
             if i % 6 == 5:
-                _attn_layer(env, GEO[True], "f")
+                _attn_layer(env, functools.partial(ld_geo, rg, True), "f")
             else:
-                _attn_layer(env, GEO[False], "s")
+                _attn_layer(env, functools.partial(ld_geo, rg, False), "s")
             _moe(env, R, nlayers, sm.pref.ptr, sm.pflag.ptr)
         c.clear()
         c.update(c0)
@@ -507,8 +554,8 @@ def barriers_per_step(nlayers):
     return nlayers * STAGES_PER_LAYER + 1
 
 
-def _attn_layer(env, geo, kind):
-    _attn_layer_t(**env, geo=geo, kind=kind)
+def _attn_layer(env, ld_geo, kind):
+    _attn_layer_t(**env, ld_geo=ld_geo, kind=kind)
 
 
 def _moe(env, R, nlayers, pref, pflag):
@@ -541,12 +588,12 @@ def _attn_layer_t(
     gw,
     cfg,
     li,
-    geo,
+    ld_geo,
     kind,
 ):
     qkv, o = SP["qkv_" + kind], SP["o_" + kind]
     M = qkv.M
-    rope = G[G_ROPE_F] if geo.full else G[G_ROPE_S]
+    rope = G[G_ROPE_F] if kind == "f" else G[G_ROPE_S]
     # qkv: rebuild h (the previous layer's raw outputs), input_layernorm, fp8
     w, buf = barrier_then(qkv, T(T_QKV_T), T(T_QKV_S), e0)
     if const_expr(cfg.combine_rows):
@@ -567,8 +614,8 @@ def _attn_layer_t(
         cnt("qkv"),
         lambda cg, tots: SL.epi_raw(c, M, qkv.N, cg, tots[0], G[G_Y]),
     )
-    # attention tasks
-    barrier_then(None, None, None, e0 + 1)
+    # attention tasks (ld_geo: the geometry, its run-time words loaded at the barrier)
+    _, geo = barrier_then(None, None, None, e0 + 1, pre=ld_geo)
     wlw = wl + c["wave"] * geo.WLF
     for t in range(gw, geo.ntask(M), c["cus"] * WAVES):
         A.attn_task(
