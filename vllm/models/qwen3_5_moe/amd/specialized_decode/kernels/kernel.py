@@ -33,6 +33,7 @@ mkcore.key.compile_key (the Cfg, the debug globals, the sources of mk/ and mkcor
 which the launcher holds; the kernel name holds a hash of that key.
 """
 
+import dataclasses
 import functools
 import pathlib
 from dataclasses import asdict, dataclass
@@ -101,6 +102,10 @@ NGLOB = 20  # global pointer-table slots
     G_ROWV,
     G_SPARE,
 ) = range(NGLOB)
+# Cfg.rt_geom 2: glob slot G_GEOM (after the slots above) holds the run-time cache
+# geometry, the i32 words of mixer.GEO (Cfg.geom_slots); the attention stages load it
+G_GEOM = NGLOB
+NGEO = 1
 # per-layer slots
 (
     T_MIX_T,
@@ -162,6 +167,24 @@ class Cfg:
     # norm / scaled prologues only in CTAs that stream units of the GEMV (Gemv.busy):
     # in_proj b / a, out_proj, router
     skip_idle: bool = True
+    rt_geom: int = 2  # 2: maxlen and maxblocks are run-time values (glob slot G_GEOM,
+    # geom_slots), so one build serves every max_model_len; 0: compiled in
+
+    def compiled(self):
+        """The Cfg the kernel is built for: rt_geom zeroes its run-time fields
+        (mixer.RT_FIELDS), so one build (one key, one name) serves every geometry that
+        differs in them only."""
+        assert self.rt_geom in (0, 2), self.rt_geom
+        if not self.rt_geom:
+            return self
+        return dataclasses.replace(self, **{f: 0 for f in X.RT_FIELDS})
+
+    def geom_slots(self):
+        """The NGEO int64 glob slots from G_GEOM: the i32 words of mixer.GEO, two a
+        slot (low word first)."""
+        w = [getattr(self, n) for n in X.GEO]
+        assert len(w) == 2 * NGEO and all(0 <= v < 2**31 for v in w), w
+        return [w[2 * k] | w[2 * k + 1] << 32 for k in range(NGEO)]
 
     def chunks(self):
         return {k[2:]: v for k, v in asdict(self).items() if k.startswith("c_")}
@@ -208,6 +231,7 @@ CNT_REGION = dict(inp=0, ba=1, out=2, qkv=3, o=4, router=5, e1=6, e2=7, lm=8)
 
 
 def build(cfg: Cfg):
+    cfg = cfg.compiled()
     M, CUS = cfg.M, cfg.cus
     K.check_cfg(cfg)
     assert 1 <= M <= WAVES, "the norm prologues and the routing give each row one wave"
@@ -221,7 +245,6 @@ def build(cfg: Cfg):
     PRF = max([s.lds_floats() for s in SP.values() if isinstance(s, Gemv)] + [4])
     ATT_W = X.QW + HD  # floats per wave (q bf16, then k_new v_new bf16 pairs)
     NTASK_G = M * NVH * 8
-    NTASK_A = M * NKV * cfg.ncmax
 
     @fx.struct
     class GemvLds:
@@ -299,6 +322,7 @@ def build(cfg: Cfg):
         rg = D.rsrc(glob)
         rt = D.rsrc(tab)
         G = [tab64(rg, k) for k in range(NGLOB)]
+        geo = X.Geo(cfg, rg, 2 * G_GEOM)
         rf = D.rsrc(G[G_FLAGS])
         # every CTA reads the epoch before its first arrival; CTA 0 advances it after
         # the last barrier, which no CTA passes before all have read it
@@ -320,8 +344,9 @@ def build(cfg: Cfg):
                     slot * 2,
                 )
 
-        def barrier_then(spec, tiles, scales, e):
-            """Arrive, prefetch the GEMV's first units, wait."""
+        def barrier_then(spec, tiles, scales, e, pre=None):
+            """Arrive, prefetch the GEMV's first units (or call pre: a stage without a
+            GEMV loads its run-time geometry there), wait."""
             w = None
             if const_expr(spec is not None):
                 # opaque ids: keep the stage's address math inside the stage
@@ -339,7 +364,8 @@ def build(cfg: Cfg):
                 slot = ((e - epoch - 1) * CUS + bid) * 2
                 stamp(slot)
             D.grid_arrive(rf, e, tid, bid, cfg.fence)
-            buf = spec.first_loads(w) if spec is not None else None
+            pre_buf = pre() if pre is not None else None
+            buf = spec.first_loads(w) if spec is not None else pre_buf
             D.grid_wait(rf, e, tid, bid, CUS, cfg.fence)
             if const_expr(PROFILE["addr"] is not None):
                 stamp(slot + 1)
@@ -393,7 +419,7 @@ def build(cfg: Cfg):
                 li=i,
             )
             if i % 4 == 3:
-                _attn_layer(env, NTASK_A)
+                _attn_layer(env, geo)
             else:
                 _gdn_layer(env, NTASK_G)
             _moe(env, R)
@@ -438,8 +464,8 @@ def _gdn_layer(env, ntask):
     _gdn_layer_t(**env, ntask=ntask)
 
 
-def _attn_layer(env, ntask):
-    _attn_layer_t(**env, ntask=ntask)
+def _attn_layer(env, geo):
+    _attn_layer_t(**env, geo=geo)
 
 
 def _moe(env, R):
@@ -553,7 +579,7 @@ def _attn_layer_t(
     gw,
     cfg,
     li,
-    ntask,
+    geo,
 ):
     M = SP["inp"].M
     hf0, hf1 = hf_ptrs(hb0, M)
@@ -569,12 +595,13 @@ def _attn_layer_t(
         cnt("qkv"),
         lambda cg, tots: SL.epi_raw(c, M, QKV_N, cg, tots[0], y),
     )
-    barrier_then(None, None, None, e0 + 1)
+    _, g = barrier_then(None, None, None, e0 + 1, pre=geo.attn)
+    ntask = M * NKV * g["ncmax"]
     for t in range(gw, ntask, c["cus"] * WAVES):
         X.attn_task(
             c,
             t,
-            cfg,
+            g,
             y,
             T(T_QN),
             T(T_KN),
@@ -587,7 +614,7 @@ def _attn_layer_t(
             wl,
         )
     w, buf = barrier_then(o, T(T_OUT_T), T(T_OUT_S), e0 + 2)
-    X.prologue_attn(c, o, xq, xs, cfg, G[G_REC], y, G[G_POS], T(T_SLOT))
+    X.prologue_attn(c, o, xq, xs, geo.attn(), G[G_REC], y, G[G_POS], T(T_SLOT))
     o.run(c, w, buf, part, cnt("o"), S.EpiRes(c, M, hb0, hb1, q1, hf1))
 
 

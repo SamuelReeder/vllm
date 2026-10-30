@@ -185,7 +185,9 @@ class Qwen35MoeGfx942Decode:
         self.slot = zi(len(self.attn_groups), Mx)
         self.sidx = zi(len(self.gdn_groups), Mx)
         m, W = self.model, self.weights
-        g = [0] * KK.NGLOB
+        g = [0] * (KK.NGLOB + KK.NGEO)
+        # the run-time cache geometry (Cfg.rt_geom): the same for every width
+        g[KK.G_GEOM :] = cfg.geom_slots()
         g[KK.G_EMBED] = m.embed_tokens.weight.data_ptr()
         g[KK.G_FNORM] = m.norm.weight.data_ptr()
         g[KK.G_ROPE] = self.rope.data_ptr()

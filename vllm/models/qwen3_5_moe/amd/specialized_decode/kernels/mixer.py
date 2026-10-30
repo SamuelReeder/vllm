@@ -61,6 +61,28 @@ PVB = 16  # P V: positions per load batch
 GQ = NQ // NKV  # 8 q heads per kv head
 REC = 16 + GQ * HD  # partial record floats (max[8] sum[8], o[8][256])
 QW = GQ * HD // 2  # wave LDS floats of q (bf16 pairs); then k_new, v_new (bf16 pairs)
+# kernel.Cfg.rt_geom 2: the Cfg fields not compiled in, and the run-time words the
+# attention stages load instead (i32 words of glob from kernel.G_GEOM, in this order)
+RT_FIELDS = ("maxlen", "maxblocks")
+GEO = ("ncmax", "maxblocks")
+GEO_ATT = ("block", "cpb", "ncmax", "maxblocks", "kv_s0", "kv_s1", "kv_s2", "kv_sv")
+
+
+class Geo:
+    """The attention stages' cache geometry: cfg's constants, and with cfg.rt_geom the
+    GEO words of glob from i32 word `word0`, loaded where attn is called (call it in the
+    scope that uses the values). cfg: the compiled Cfg."""
+
+    def __init__(self, cfg, rg, word0):
+        self.cfg, self.rg, self.word0 = cfg, rg, word0
+
+    def attn(self):
+        """attn_task's and prologue_attn's geometry: dict of GEO_ATT plus kv_xpack."""
+        g = {n: getattr(self.cfg, n) for n in GEO_ATT}
+        if self.cfg.rt_geom:
+            for k, n in enumerate(GEO):
+                g[n] = D.uniform(D.ld(self.rg, self.word0 + k))
+        return dict(g, kv_xpack=self.cfg.kv_xpack)
 
 
 # ------------------------------------------------------------------ GDN
@@ -214,15 +236,13 @@ def rms_rope(lane, vals, w_word, cs, rope):
 
 
 @D.traced
-def attn_task(
-    c, task, cfg, y_qkv, qn_w, kn_w, rope_cs, kv, bt, slotp, pos_ptr, rec, wl
-):
-    """One (m, j, ci) task; wl: this wave's LDS (QW + HD floats).
-    Chunk ci covers positions [p0, pe) inside KV block b = ci // cpb (see kernel.Cfg).
-    Writes the chunk's partial record (merged by prologue_attn)."""
+def attn_task(c, task, g, y_qkv, qn_w, kn_w, rope_cs, kv, bt, slotp, pos_ptr, rec, wl):
+    """One (m, j, ci) task; wl: this wave's LDS (QW + HD floats); g: the cache geometry
+    (Geo.attn). Chunk ci covers positions [p0, pe) inside KV block b = ci // cpb (see
+    kernel.Cfg). Writes the chunk's partial record (merged by prologue_attn)."""
     lane = c["lane"]
     D.PROBE["on"] = D.PROBE.get("stage") == "attn"
-    ncmax, cpb, B = cfg.ncmax, cfg.cpb, cfg.block
+    ncmax, cpb, B = g["ncmax"], g["cpb"], g["block"]
     m = task // (NKV * ncmax)
     j = task % (NKV * ncmax) // ncmax
     ci = task % ncmax
@@ -232,8 +252,8 @@ def attn_task(
     p0 = b * B + ci % cpb * CH
     if (p0 <= pos) & (slot >= 0):
         pe = fx.min(p0 + CH, (b + 1) * B)
-        blk = D.uniform(D.ld(D.rsrc(bt), m * cfg.maxblocks + b))
-        base = kv + (fx.Int64(blk) * cfg.kv_s0 + j * cfg.kv_s1) * 2
+        blk = D.uniform(D.ld(D.rsrc(bt), m * g["maxblocks"] + b))
+        base = kv + (fx.Int64(blk) * g["kv_s0"] + j * g["kv_s1"]) * 2
         _attn_chunk(
             c,
             lane,
@@ -244,7 +264,7 @@ def attn_task(
             p0,
             pe,
             b * B,
-            cfg,
+            g,
             y_qkv,
             qn_w,
             kn_w,
@@ -266,7 +286,7 @@ def _attn_chunk(
     p0,
     pe,
     pb,
-    cfg,
+    g,
     y_qkv,
     qn_w,
     kn_w,
@@ -283,7 +303,7 @@ def _attn_chunk(
     ybase = m * QKV_N
     d0 = 4 * lane
     rk = D.rsrc(base)
-    s2, sv, B, xp = cfg.kv_s2, cfg.kv_sv, cfg.block, cfg.kv_xpack
+    s2, sv, B, xp = g["kv_s2"], g["kv_sv"], g["block"], g["kv_xpack"]
     lastp = fx.min(pos, pe - 1)  # the chunk's last live position
     p = p0 + lane
     live = p <= lastp
@@ -425,7 +445,7 @@ def _attn_chunk(
     D.probe(c, 7)
     # ---- partial record (merged by the o_proj prologue, prologue_attn)
     rr = D.rsrc(rec)
-    rbase = ((m * NKV + j) * cfg.ncmax + ci) * REC
+    rbase = ((m * NKV + j) * g["ncmax"] + ci) * REC
     if lane < GQ:
         D.st(_sel6(lane, mx), rr, rbase + lane, D.CM_DEV)
         D.st(_sel6(lane, sm), rr, rbase + 8 + lane, D.CM_DEV)
@@ -509,11 +529,12 @@ MERGE_RB = 4  # chunk records per load batch of prologue_attn
 
 
 @D.traced
-def prologue_attn(c, g, xq, xs, cfg, rec, y_qkv, pos_ptr, slotp):
+def prologue_attn(c, g, xq, xs, geo, rec, y_qkv, pos_ptr, slotp):
     """o_proj prologue: LDS x <- the attention output of the CTA's chunk (one head:
     g.Kc == HD), quantized. Thread item (row t, dims d .. d + 7) merges the head's
     chunk records in chunk order (online softmax: running max, rescaled sum and o),
-    then x = o / sum * sigmoid(gate). Rows without a KV slot (padding) give x = 0."""
+    then x = o / sum * sigmoid(gate). Rows without a KV slot (padding) give x = 0.
+    geo: the cache geometry (Geo.attn)."""
     assert g.Kc == HD and g.slots == 1
     M, tid, NT = g.M, c["tid"], S.NT
     SL.zero_xs_tail(c, g, xs)
@@ -523,7 +544,8 @@ def prologue_attn(c, g, xq, xs, cfg, rec, y_qkv, pos_ptr, slotp):
 
     def nchunk(t):
         pos = D.ld(rp, t)
-        n = pos // cfg.block * cfg.cpb + pos % cfg.block // CH + 1  # chunks up to pos's
+        B = geo["block"]
+        n = pos // B * geo["cpb"] + pos % B // CH + 1  # chunks up to pos's
         return (D.ld(rs, t) >= 0).select(n, fx.Int32(0))
 
     nmax = fx.Int32(0)
@@ -537,7 +559,7 @@ def prologue_attn(c, g, xq, xs, cfg, rec, y_qkv, pos_ptr, slotp):
         d = q % (HD // 8) * 8
         gb = t * QKV_N + h * 2 * HD + HD + d
         gt = (D.ld(ry, gb, 4, T.f32, D.CM_DEV), D.ld(ry, gb + 4, 4, T.f32, D.CM_DEV))
-        items.append((i, t, d, nchunk(t), ((t * NKV + j) * cfg.ncmax) * REC, gt))
+        items.append((i, t, d, nchunk(t), ((t * NKV + j) * geo["ncmax"]) * REC, gt))
     # loop-carried state per item: [max, sum, o0 .. o7] (updated in place, as the
     # FlyDSL loop rewriter carries subscript stores)
     st = [
