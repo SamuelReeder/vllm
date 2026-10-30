@@ -15,14 +15,17 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.models.common.specialized_decode.hipdnn_launch import refuse_launch
 from vllm.models.common.specialized_decode.spec import DecodeSpec
 from vllm.models.qwen3_5.amd.specialized_decode.spec import (
     _backends_missing,
     _gpu_arch,
-    _skip_step,
     _widths,
     attention_backend,
     kv_geometry,
+)
+from vllm.models.qwen3_5.amd.specialized_decode.spec import (
+    _skip_step as _decode_only_skip_step,
 )
 
 from .kernels.dims import (
@@ -45,6 +48,8 @@ from .kernels.dims import (
 
 if TYPE_CHECKING:
     from .runtime.decode import Gemma4Gfx942Decode
+
+NAME = "gemma4-26b-a4b-fp8-gfx942"  # also the hipDNN op id's model (hipdnn_launch.py)
 
 # The text config's keys that differ by layer type: Transformers' Gemma 4 config keeps
 # them in its per_layer_config (checked per layer below).
@@ -188,7 +193,7 @@ def _refuse_config(vllm_config) -> list[str]:
     missing = _backends_missing()
     if missing is not None:
         reasons.append(f"needs FlyDSL and AITER's FlyDSL helpers ({missing})")
-    return reasons
+    return reasons + refuse_launch()
 
 
 def _refuse_model(lm) -> list[str]:
@@ -263,6 +268,14 @@ def _gemma_widths(vllm_config) -> tuple[int, ...]:
     return tuple(_widths(vllm_config))
 
 
+def _skip_step(vllm_config, decode: "Gemma4Gfx942Decode", width: int) -> str | None:
+    """Why this step keeps vLLM's path: a width without a launch (hipDNN can decline a
+    width at warm-up), or a step that is not decode-only (Qwen3.8's checks)."""
+    if decode.hipdnn is not None and (why := decode.hipdnn.declined(width)):
+        return why
+    return _decode_only_skip_step(vllm_config, decode, width)
+
+
 def _build(vllm_config, lm, widths: tuple[int, ...]) -> "Gemma4Gfx942Decode":
     from .runtime.decode import Gemma4Gfx942Decode
 
@@ -270,7 +283,7 @@ def _build(vllm_config, lm, widths: tuple[int, ...]) -> "Gemma4Gfx942Decode":
 
 
 DECODE_SPEC = DecodeSpec["Gemma4Gfx942Decode"](
-    name="gemma4-26b-a4b-fp8-gfx942",
+    name=NAME,
     supports=frozenset(),
     widths=_gemma_widths,
     refuse_config=_refuse_config,

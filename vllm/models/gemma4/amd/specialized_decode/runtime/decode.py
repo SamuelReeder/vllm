@@ -17,6 +17,7 @@ vLLM pads a step with (slot mapping -1) writes no KV and selects no routed exper
 """
 
 import dataclasses
+import pathlib
 from collections.abc import Mapping
 from typing import Any
 
@@ -24,6 +25,13 @@ import torch
 
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.models.common.specialized_decode.hipdnn_launch import (
+    HIPDNN,
+    HipdnnLaunch,
+    kv_class,
+    launch_backend,
+    payload,
+)
 from vllm.models.common.specialized_decode.spec import Step
 
 from ..kernels import kernel as KK
@@ -43,7 +51,8 @@ from ..kernels.dims import (
     H,
     is_full,
 )
-from ..spec import attention_backend, kv_geometry
+from ..kernels.mkcore import key as KEY
+from ..spec import NAME, attention_backend, kv_geometry
 from .weights import PackedWeights
 
 logger = init_logger(__name__)
@@ -88,6 +97,8 @@ class Gemma4Gfx942Decode:
         self.maxlen = vllm_config.model_config.max_model_len
         self.cus = torch.cuda.get_device_properties(device).multi_processor_count
         self.chunks = default_chunks()
+        # the launch backend (hipdnn_launch.py); None: the FlyDSL JIT launch
+        self.hipdnn = HipdnnLaunch(NAME) if launch_backend() == HIPDNN else None
         self.weights = PackedWeights(layers, self.chunks)
         Mx = max(widths)
         z = lambda *s, dt=torch.float32: torch.zeros(*s, dtype=dt, device=device)  # noqa: E731
@@ -172,7 +183,8 @@ class Gemma4Gfx942Decode:
             assert cfg.chunks() == self.chunks, (cfg.chunks(), self.chunks)
             if self.cfgs.get(w) != cfg:
                 self.cfgs[w] = cfg
-                self.launches[w] = KK.build(cfg)
+                if self.hipdnn is None:  # hipDNN launches prebuilt code objects
+                    self.launches[w] = KK.build(cfg)
         Mx = max(self.widths)
         cfg = self.cfgs[Mx]
         self.part = torch.zeros(
@@ -255,6 +267,31 @@ class Gemma4Gfx942Decode:
             r[KK.T_BT] = self.bt[group[i]].data_ptr()
             r[KK.T_SLOT] = self.slot[group[i]].data_ptr()
         self.tab = tab.to(self.device)
+        if self.hipdnn is not None:
+            # before CUDA graph capture: one plan per width. The payload's KV layout
+            # class and block are the sliding layers' (the full ones' are in src)
+            name = self.attn_names[0]
+            kv = kv_class(attention_backend(sfc[name]), caches[name], NKV_S, HD_S)
+            kdir = pathlib.Path(KK.__file__).resolve().parent
+            arch = torch.cuda.get_device_properties(self.device).gcnArchName
+            tp = self.vllm_config.parallel_config.tensor_parallel_size
+            self.hipdnn.prepare(
+                {
+                    w: payload(
+                        NAME,
+                        c,
+                        KEY.compile_key,
+                        kdir,
+                        arch=arch.split(":")[0],
+                        kv=kv,
+                        block=bs,
+                        tp=tp,
+                        nlayers=NL,
+                    )
+                    for w, c in self.cfgs.items()
+                },
+                [self.tab, self.glob],
+            )
         logger.info(
             "Gemma 4 26B-A4B gfx942 decode: KV blocks %d (sliding) / %d (full), "
             "%d KV cache groups, widths %s",
@@ -293,12 +330,16 @@ class Gemma4Gfx942Decode:
 
     def launch(self, width: int, glob: torch.Tensor, layers: int = NL) -> torch.Tensor:
         assert self.tab is not None
-        self.launches[width](
-            self.tab.data_ptr(),
-            glob.data_ptr(),
-            layers,
-            stream=torch.cuda.current_stream(),
-        )
+        if self.hipdnn is not None:
+            assert layers == NL, "the hipDNN payload launches every layer"
+            self.hipdnn.launch(width, [self.tab, glob])
+        else:
+            self.launches[width](
+                self.tab.data_ptr(),
+                glob.data_ptr(),
+                layers,
+                stream=torch.cuda.current_stream(),
+            )
         return self.out[:width]
 
     def run(self, step: Step, input_ids, inputs_embeds, **kwargs) -> torch.Tensor:
