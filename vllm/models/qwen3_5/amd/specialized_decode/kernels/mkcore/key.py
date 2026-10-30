@@ -40,10 +40,13 @@ def source_hash(pkg_dir) -> str:
 
 
 def compile_key(cfg, pkg_dir, *extra) -> str:
-    """Key of FlyDSL's disk cache for one build: repr((cfg, *extra)) (extra: the model's
-    debug globals that change the traced code), mkcore's SRC_HASH and the sources of the
-    model's kernel package pkg_dir."""
-    h = hashlib.sha256(repr((cfg, *extra)).encode())
+    """Key of FlyDSL's disk cache for one build: repr((cfg.compiled(), *extra)) (extra:
+    the model's debug globals that change the traced code), mkcore's SRC_HASH and the
+    sources of the model's kernel package pkg_dir. cfg.compiled() is the Cfg the code
+    object is built for (its run-time fields normalized, e.g. maxlen and maxblocks 0 at
+    rt_geom 2), so Cfgs that differ in run-time fields only have one key; it is
+    idempotent, so a caller may pass cfg or cfg.compiled()."""
+    h = hashlib.sha256(repr((cfg.compiled(), *extra)).encode())
     h.update(SRC_HASH.encode())
     h.update(source_hash(pkg_dir).encode())
     return h.hexdigest()
