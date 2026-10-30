@@ -6,6 +6,12 @@ The kernel itself needs a gfx942 GPU and the 27B checkpoint; here it is a stub, 
 spec's decisions (which deployments, caches and steps the kernel takes) run anywhere.
 """
 
+import dataclasses
+import json
+import os
+import pathlib
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,9 +20,11 @@ import torch
 
 from tests.models.common.specialized_decode.kit import DecodeConformance, forward
 from vllm.config.compilation import CUDAGraphMode
+from vllm.models.common.specialized_decode import hipdnn_launch as hl
 from vllm.models.common.specialized_decode.guards import select_decode_spec
 from vllm.models.common.specialized_decode.spec import DecodeUnsupported
 from vllm.models.qwen3_5.amd.specialized_decode import spec as sd
+from vllm.models.qwen3_5.amd.specialized_decode.kernels.mkcore import key as mk_key
 
 SPECS = (sd.DECODE_SPEC,)
 LAYERS = 64
@@ -28,6 +36,8 @@ SLOTS = 4
 
 class _StubDecode:
     """The runtime's interface, without FlyDSL or the weights."""
+
+    hipdnn: hl.HipdnnLaunch | None = None  # the FlyDSL launch
 
     def __init__(self, vllm_config, lm, widths):
         layers = lm.model.layers
@@ -396,3 +406,157 @@ def test_interleaved_v_cache_refuses():
     sfc[name] = _attn_layer(sfc[name].kv_cache, interleaved_v=True)
     with pytest.raises(DecodeUnsupported, match="INTERLEAVED_V"):
         decode.bind_caches()
+
+
+# ------------------------------------------------------------- hipDNN launch backend
+@dataclasses.dataclass(frozen=True)
+class _Cfg:
+    """The fields of kernels/kernel.Cfg that the payload reads (kernel.py imports
+    FlyDSL and AITER, so it does not load here): compiled() zeroes the run-time
+    geometry at rt_geom 2, as Cfg.compiled() does."""
+
+    M: int
+    cus: int
+    maxlen: int
+    maxblocks: int
+    lm_head: bool = False
+    tp: int = 1
+    rt_geom: int = 2
+
+    def compiled(self):
+        if not self.rt_geom:
+            return self
+        return dataclasses.replace(self, maxlen=0, maxblocks=0)
+
+
+def _exporter_fields(model, cfg, kdir, kv, block, tp):
+    """The exporter's fields of one Cfg: megakernels common/scripts/export_co.py
+    (src_key, _export_rank)."""
+    c = cfg.compiled() if hasattr(cfg, "compiled") else cfg
+    return dict(
+        model=model,
+        src=mk_key.compile_key(c, kdir),
+        arch="gfx942",
+        cus=cfg.cus,
+        kv=kv,
+        block=block,
+        M=cfg.M,
+        tp=tp,
+        rt=getattr(cfg, "rt_geom", 0) or 0,
+        lm_head=bool(cfg.lm_head),
+    )
+
+
+def _payload(cfg, kv="ROCM_ATTN", tp=1):
+    kdir = pathlib.Path(mk_key.__file__).resolve().parent.parent
+    p = hl.payload(
+        sd.NAME,
+        cfg,
+        mk_key.compile_key,
+        kdir,
+        arch="gfx942",
+        kv=kv,
+        block=BLOCK,
+        tp=tp,
+        nlayers=LAYERS,
+    )
+    return json.loads(p), _exporter_fields(sd.NAME, cfg, kdir, kv, BLOCK, tp)
+
+
+@pytest.mark.parametrize("tp, rt", [(1, 2), (2, 0)])
+def test_hipdnn_payload_is_the_exporters_key(tp, rt):
+    got, want = _payload(_Cfg(4, 304, 4096, 6, tp=tp, rt_geom=rt), tp=tp)
+    assert got.pop("schema") == 1 and got.pop("nlayers") == LAYERS
+    assert got == want
+    # rt 2: one code object serves every max_model_len; rt 0: one per max_model_len
+    other, _ = _payload(_Cfg(4, 304, 8192, 11, tp=tp, rt_geom=rt), tp=tp)
+    assert (other["src"] == got["src"]) == (rt == 2)
+
+
+@pytest.mark.parametrize(
+    "layout, backend, want",
+    [
+        ("planar", "ROCM_ATTN", "ROCM_ATTN"),
+        ("per_head", "TRITON_ATTN", "TRITON_ATTN:1"),
+        ("planar", "TRITON_ATTN", "TRITON_ATTN:2"),
+    ],
+)
+def test_hipdnn_kv_class_is_the_exporters(layout, backend, want):
+    assert hl.kv_class(backend, _kv(layout), 4, sd.HEAD_DIM) == want
+
+
+def _hipdnn(monkeypatch, verdicts: dict[int, str], peers_agree=lambda w: True):
+    """A HipdnnLaunch whose custom op answers ``verdicts`` (width -> decline reason,
+    "" for a plan) and whose other TP ranks agree per ``peers_agree``."""
+    monkeypatch.setattr(hl, "refuse_launch", lambda: [])
+    launched = []
+
+    def prepare(op_id, payload, inputs):
+        return verdicts[json.loads(payload)["M"]]
+
+    def execute(op_id, payload, inputs, strict):
+        launched.append((op_id, json.loads(payload)["M"], strict))
+
+    monkeypatch.setattr(hl, "_ops", lambda: (prepare, execute))
+    agree = iter([peers_agree(w) for w in sorted(verdicts)])
+    monkeypatch.setattr(hl, "tp_agree", lambda ok, group: next(agree) and ok)
+    launch = hl.HipdnnLaunch(sd.NAME)
+    launch.prepare({w: json.dumps({"M": w}) for w in verdicts}, [])
+    return launch, launched
+
+
+def test_hipdnn_declined_width_takes_vllm_path(monkeypatch):
+    launch, launched = _hipdnn(
+        monkeypatch, {1: "", 2: "NOT_APPLICABLE: no code object", 4: "", 8: ""}
+    )
+    assert launch.op_id == "megakernel.qwen38-27b-mxfp4-gfx942"
+    decode = _decode()
+    decode.kernel.hipdnn = launch
+    with forward(decode.vllm_config, CUDAGraphMode.FULL, _md(decode)):
+        assert decode.plan(torch.zeros(2, dtype=torch.long)) is None
+        step = decode.plan(torch.zeros(4, dtype=torch.long))
+        why = sd._skip_step(decode.vllm_config, decode.kernel, 2)
+    assert step is not None and step.kernel_width == 4
+    assert "NOT_APPLICABLE: no code object" in why
+    launch.launch(4, [])
+    assert launched == [(launch.op_id, 4, True)]  # strict: an execute decline raises
+
+
+def test_hipdnn_no_plan_for_any_width_raises(monkeypatch):
+    with pytest.raises(DecodeUnsupported, match="no plan for any width"):
+        _hipdnn(monkeypatch, {1: "NOT_APPLICABLE: src", 2: "NOT_APPLICABLE: src"})
+
+
+def test_hipdnn_tp_disagreement_declines_on_every_rank(monkeypatch):
+    """This rank has a plan for width 4, another rank has none: both decline it."""
+    launch, _ = _hipdnn(monkeypatch, {1: "", 4: ""}, peers_agree=lambda w: w != 4)
+    assert launch.declined(1) is None
+    assert "another TP rank declined" in launch.declined(4)
+
+
+def test_hipdnn_without_opt_in_refuses_at_startup(monkeypatch):
+    monkeypatch.setenv("VLLM_SPECIALIZED_DECODE_LAUNCH", "hipdnn")
+    monkeypatch.setitem(sys.modules, "hipdnn_vllm", None)  # not installed
+    with pytest.raises(DecodeUnsupported, match="install the hipdnn_vllm"):
+        select_decode_spec(make_config(), SPECS)
+    off = SimpleNamespace(op_enabled=lambda op: False)
+    config = SimpleNamespace(load_config=lambda: off)
+    monkeypatch.setitem(sys.modules, "hipdnn_vllm", SimpleNamespace(config=config))
+    monkeypatch.setitem(sys.modules, "hipdnn_vllm.config", config)
+    with pytest.raises(DecodeUnsupported, match="add custom_op to HIPDNN_VLLM_OPS"):
+        select_decode_spec(make_config(), SPECS)
+
+
+def test_default_launch_is_flydsl_without_hipdnn():
+    """No VLLM_SPECIALIZED_DECODE_LAUNCH: the FlyDSL launch, and the spec does not
+    import hipdnn_vllm."""
+    code = (
+        "import sys\n"
+        "from vllm.models.qwen3_5.amd.specialized_decode import spec\n"
+        "from vllm.models.common.specialized_decode import hipdnn_launch as hl\n"
+        "assert hl.launch_backend() == 'flydsl' and hl.refuse_launch() == []\n"
+        "assert 'hipdnn_vllm' not in sys.modules\n"
+    )
+    env = dict(os.environ)
+    env.pop("VLLM_SPECIALIZED_DECODE_LAUNCH", None)
+    subprocess.run([sys.executable, "-c", code], check=True, env=env)
