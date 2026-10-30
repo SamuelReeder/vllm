@@ -13,11 +13,13 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.forward_context import get_forward_context
+from vllm.models.common.specialized_decode.hipdnn_launch import refuse_launch
 from vllm.models.common.specialized_decode.spec import DecodeSpec
 
 if TYPE_CHECKING:
     from .runtime.decode import Qwen35Gfx942Decode
 
+NAME = "qwen38-27b-mxfp4-gfx942"  # also the hipDNN op id's model (hipdnn_launch.py)
 MAX_ROWS = 8  # the kernel's norm prologues give each row one of a CTA's 8 waves
 NKV, HEAD_DIM = 4, 256  # the attention layers' KV heads
 NVH, DV, DK, CONV_DIM = 48, 128, 128, 10240  # GDN value heads, head dims, conv channels
@@ -172,7 +174,7 @@ def _refuse_config(vllm_config) -> list[str]:
     missing = _backends_missing()
     if missing is not None:
         reasons.append(f"needs FlyDSL and AITER's FlyDSL helpers ({missing})")
-    return reasons
+    return reasons + refuse_launch()
 
 
 def _refuse_model(lm) -> list[str]:
@@ -237,7 +239,9 @@ def _refuse_caches(vllm_config, decode: "Qwen35Gfx942Decode", caches) -> list[st
 
 def _skip_step(vllm_config, decode: "Qwen35Gfx942Decode", width: int) -> str | None:
     """Why this step keeps vLLM's path: the kernel takes decode-only steps of one token
-    a request."""
+    a request, at widths that have a launch (hipDNN can decline a width at warm-up)."""
+    if decode.hipdnn is not None and (why := decode.hipdnn.declined(width)):
+        return why
     md = get_forward_context().attn_metadata
     if not isinstance(md, dict):  # a profile / dummy run
         return "no attention metadata"
@@ -261,7 +265,7 @@ def _build(vllm_config, lm, widths: tuple[int, ...]) -> "Qwen35Gfx942Decode":
 
 
 DECODE_SPEC = DecodeSpec["Qwen35Gfx942Decode"](
-    name="qwen38-27b-mxfp4-gfx942",
+    name=NAME,
     supports=frozenset(),
     widths=_widths,
     refuse_config=_refuse_config,

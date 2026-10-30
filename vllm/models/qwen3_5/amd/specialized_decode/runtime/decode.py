@@ -23,6 +23,7 @@ order. The step plan depends only on the scheduler output, which every rank rece
 identically (``VLLM_SPECIALIZED_DECODE_CHECK_PATHS`` checks it).
 """
 
+import pathlib
 from collections.abc import Mapping
 from typing import Any
 
@@ -32,12 +33,20 @@ from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.models.common.specialized_decode.guards import tp_agree
+from vllm.models.common.specialized_decode.hipdnn_launch import (
+    HIPDNN,
+    HipdnnLaunch,
+    kv_class,
+    launch_backend,
+    payload,
+)
 from vllm.models.common.specialized_decode.spec import Step
 
 from ..kernels import kernel as KK
 from ..kernels import mixer as X
 from ..kernels.dims import NL, ROT, THETA, Dims, H, is_attn
-from ..spec import attention_backend, kv_geometry, tp_size
+from ..kernels.mkcore import key as KEY
+from ..spec import HEAD_DIM, NAME, attention_backend, kv_geometry, tp_size
 from .weights import PackedWeights
 
 logger = init_logger(__name__)
@@ -86,15 +95,19 @@ class Qwen35Gfx942Decode:
         if self.tp > 1:
             assert emb.shard_indices.org_vocab_start_index == d.vocab_off(self.rank)
         # every rank must reach the peer buffer's collective: agree first on the
-        # packing, which can fail on one rank (out of memory)
+        # hipDNN runtime load and the packing, which can fail on one rank (out of
+        # memory). hipdnn: the launch backend (hipdnn_launch.py); None: FlyDSL JIT
         failure: Exception | None = None
+        self.hipdnn: HipdnnLaunch | None = None
         try:
+            if launch_backend() == HIPDNN:
+                self.hipdnn = HipdnnLaunch(NAME)
             self.weights = PackedWeights(layers, self.tp)
         except Exception as err:
             failure = err
         if not tp_agree(failure is None, group.cpu_group if group else None):
             raise RuntimeError(
-                "Qwen3.8 gfx942 decode: weight packing failed on "
+                "Qwen3.8 gfx942 decode: hipDNN load or weight packing failed on "
                 f"{'this' if failure else 'another'} TP rank"
             ) from failure
         self.peer = None
@@ -192,7 +205,8 @@ class Qwen35Gfx942Decode:
             )
             if self.cfgs.get(w) != cfg:
                 self.cfgs[w] = cfg
-                self.launches[w] = KK.build(cfg)
+                if self.hipdnn is None:  # hipDNN launches prebuilt code objects
+                    self.launches[w] = KK.build(cfg)
         Mx = max(self.widths)
         cfg = self.cfgs[Mx]
         self.part = torch.zeros(
@@ -283,6 +297,30 @@ class Qwen35Gfx942Decode:
                 ]
             )
         self.tab = tab.to(self.device)
+        if self.hipdnn is not None:
+            # before CUDA graph capture: one plan per width, agreed over the TP group
+            kdir = pathlib.Path(KK.__file__).resolve().parent
+            arch = torch.cuda.get_device_properties(self.device).gcnArchName
+            kv = kv_class(
+                attention_backend(sfc[self.attn_names[0]]), kv0, self.d.nkv, HEAD_DIM
+            )
+            self.hipdnn.prepare(
+                {
+                    w: payload(
+                        NAME,
+                        c,
+                        KEY.compile_key,
+                        kdir,
+                        arch=arch.split(":")[0],
+                        kv=kv,
+                        block=block,
+                        tp=self.tp,
+                        nlayers=NL,
+                    )
+                    for w, c in self.cfgs.items()
+                },
+                [self.tab, self.glob],
+            )
         logger.info(
             "Qwen3.8 gfx942 decode: TP rank %d of %d, KV block %d, %d block-table "
             "columns, %d attention and %d GDN cache groups, widths %s",
@@ -322,12 +360,16 @@ class Qwen35Gfx942Decode:
 
     def launch(self, width: int, glob: torch.Tensor, layers: int = NL) -> torch.Tensor:
         assert self.tab is not None
-        self.launches[width](
-            self.tab.data_ptr(),
-            glob.data_ptr(),
-            layers,
-            stream=torch.cuda.current_stream(),
-        )
+        if self.hipdnn is not None:
+            assert layers == NL, "the hipDNN payload launches every layer"
+            self.hipdnn.launch(width, [self.tab, glob])
+        else:
+            self.launches[width](
+                self.tab.data_ptr(),
+                glob.data_ptr(),
+                layers,
+                stream=torch.cuda.current_stream(),
+            )
         return self.out[:width]
 
     def run(self, step: Step, input_ids, inputs_embeds, **kwargs) -> torch.Tensor:
