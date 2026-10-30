@@ -216,6 +216,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
+    VLLM_SPECIALIZED_DECODE_CHECK_PATHS: bool = False
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1671,6 +1672,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use the SM100 BF16 GEMM-AR kernel for eligible Kimi-K3 row-parallel
     # attention projections. All TP ranks must belong to one NVLink domain.
     "VLLM_KIMI_K3_GEMM_AR": lambda: bool(int(os.getenv("VLLM_KIMI_K3_GEMM_AR", "1"))),
+    # Debug: check every step that all TP ranks planned the same specialized
+    # decode step (kernel or vLLM's path), with one CPU all-reduce per eager step.
+    # A rank that takes another path makes the kernel's in-kernel collectives hang.
+    "VLLM_SPECIALIZED_DECODE_CHECK_PATHS": lambda: bool(
+        int(os.getenv("VLLM_SPECIALIZED_DECODE_CHECK_PATHS", "0"))
+    ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3
     # attention/shared-expert projections, DeepSeek-V4.1 ``wo_b``). All TP

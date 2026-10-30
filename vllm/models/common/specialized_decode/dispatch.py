@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Generic
 
 import torch
 
+import vllm.envs as envs
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
@@ -134,6 +135,8 @@ class SpecializedDecode(Generic[KernelT]):
             why = "caches not bound"
         else:
             why = self.spec.skip_step(self.vllm_config, self.kernel, kernel_width)
+        if envs.VLLM_SPECIALIZED_DECODE_CHECK_PATHS:
+            self._check_same_path(0 if why is not None else kernel_width)
         if why is not None:
             logger.info_once(
                 "Specialized decode %s: step on vLLM's path (%s)", self.spec.name, why
@@ -141,6 +144,22 @@ class SpecializedDecode(Generic[KernelT]):
             return None
         assert kernel_width is not None
         return Step(width=width, kernel_width=kernel_width, positions=positions)
+
+    def _check_same_path(self, kernel_width: int) -> None:
+        """Debug: raise unless every TP rank planned the same step (0: vLLM's path).
+        A kernel with in-kernel collectives hangs when one rank launches it and
+        another does not. The plan depends only on the scheduler output, so this
+        check (one CPU all-reduce per eager step) is off by default."""
+        group = tp_group()[2]
+        if group is None:
+            return
+        t = torch.tensor([kernel_width, -kernel_width], dtype=torch.int64)
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX, group=group)
+        if t[0] != -t[1]:
+            raise RuntimeError(
+                f"Specialized decode {self.spec.name}: TP ranks planned different "
+                f"steps (kernel widths {-int(t[1])} .. {int(t[0])}, 0: vLLM's path)"
+            )
 
     def run(self, step: Step, input_ids, inputs_embeds, **kwargs) -> Any:
         """Run the specialized kernel, returning what the model's own forward would

@@ -80,18 +80,22 @@ class _Layer(torch.nn.Module):
         return self._mods[target]
 
 
-def _kv(layout: str = "planar") -> torch.Tensor:
+def _kv(layout: str = "planar", tp: int = 1) -> torch.Tensor:
+    """A rank's KV view: it holds 4 / tp KV heads."""
+    nkv = 4 // tp
     if layout == "planar":  # [blocks, K|V, block, NKV HD]
-        return torch.zeros(3, 2, BLOCK, 4 * 256, dtype=torch.bfloat16)
+        return torch.zeros(3, 2, BLOCK, nkv * 256, dtype=torch.bfloat16)
     return torch.zeros(
-        3, 4, BLOCK, 512, dtype=torch.bfloat16
+        3, nkv, BLOCK, 512, dtype=torch.bfloat16
     )  # [blocks, NKV, block, K|V]
 
 
-def _state() -> tuple[torch.Tensor, torch.Tensor]:
-    page = torch.zeros(SLOTS, 3 * 10240 * 2 + 48 * 128 * 128 * 4, dtype=torch.uint8)
-    conv = page[:, : 3 * 10240 * 2].view(torch.bfloat16).view(SLOTS, 3, 10240)
-    ssm = page[:, 3 * 10240 * 2 :].view(torch.float32).view(SLOTS, 48, 128, 128)
+def _state(tp: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    """A rank's GDN state: 10240 / tp conv channels, 48 / tp SSM heads."""
+    ch, nvh = 10240 // tp, 48 // tp
+    page = torch.zeros(SLOTS, 3 * ch * 2 + nvh * 128 * 128 * 4, dtype=torch.uint8)
+    conv = page[:, : 3 * ch * 2].view(torch.bfloat16).view(SLOTS, 3, ch)
+    ssm = page[:, 3 * ch * 2 :].view(torch.float32).view(SLOTS, nvh, 128, 128)
     return conv, ssm
 
 
@@ -161,12 +165,14 @@ def make_config(**overrides) -> Any:
 
 
 def make_model(config, quantized: bool = True) -> SimpleNamespace:
+    """A loaded model with the caches of one rank of the config's TP size."""
+    tp = config.parallel_config.tensor_parallel_size
     layers = [_Layer(i, quantized) for i in range(LAYERS)]
     sfc = config.compilation_config.static_forward_context
     for i in ATTN:
-        sfc[layers[i].self_attn.attn.layer_name] = _attn_layer(_kv())
+        sfc[layers[i].self_attn.attn.layer_name] = _attn_layer(_kv(tp=tp))
     for i in GDN:
-        sfc[layers[i].linear_attn.prefix] = SimpleNamespace(kv_cache=_state())
+        sfc[layers[i].linear_attn.prefix] = SimpleNamespace(kv_cache=_state(tp))
     return SimpleNamespace(
         model=SimpleNamespace(layers=layers),
         named_parameters=lambda: [
@@ -214,6 +220,13 @@ class TestQwen35Gfx942Spec(DecodeConformance):
             layers[3].self_attn.attn.layer_name: _kv().to(torch.float16),
             layers[0].linear_attn.prefix: (conv.float(), ssm),
         }
+
+
+class TestQwen35Gfx942SpecTP2(TestQwen35Gfx942Spec):
+    """The same spec at tensor parallel 2: one rank's view, its caches per rank."""
+
+    def make_config(self, **overrides):
+        return make_config(parallel_config__tensor_parallel_size=2, **overrides)
 
 
 def _decode(config=None):
@@ -271,7 +284,7 @@ def test_widths_follow_max_num_seqs(seqs, widths):
 @pytest.mark.parametrize(
     "overrides",
     [
-        dict(parallel_config__tensor_parallel_size=2),
+        dict(parallel_config__tensor_parallel_size=4),
         dict(cache_config__cache_dtype="fp8"),
         dict(cache_config__mamba_ssm_cache_dtype="bfloat16"),
         dict(model_config__dtype=torch.float16),
@@ -311,33 +324,52 @@ def test_unquantized_model_refuses():
         TestQwen35Gfx942Spec().make_decode(config, model)
 
 
-@pytest.mark.parametrize("layout", ["planar", "per_head"])
-def test_kv_geometry_reads_triton_layouts(layout):
-    kv = _kv(layout)
-    block, s0, s_head, s_pos, s_v, xpack = sd.kv_geometry(kv, "TRITON_ATTN")
+def test_tp2_refuses_caches_of_all_heads():
+    """At TP 2 a rank's caches hold half the heads: a TP 1 sized cache is refused."""
+    config = make_config(parallel_config__tensor_parallel_size=2)
+    model = make_model(config)
+    decode = TestQwen35Gfx942Spec().make_decode(config, model, bind=False)
+    sfc = config.compilation_config.static_forward_context
+    attn, gdn = decode.kernel.attn_names[0], decode.kernel.gdn_names[0]
+    sfc[attn] = _attn_layer(_kv(tp=1))
+    sfc[gdn] = SimpleNamespace(kv_cache=_state(tp=1))
+    with pytest.raises(DecodeUnsupported) as err:
+        decode.bind_caches()
+    assert attn in str(err.value) and "conv state" in str(err.value)
+    assert "SSM state" in str(err.value)
+
+
+@pytest.mark.parametrize(
+    "layout, tp", [("planar", 1), ("per_head", 1), ("per_head", 2)]
+)
+def test_kv_geometry_reads_triton_layouts(layout, tp):
+    kv = _kv(layout, tp)
+    block, s0, s_head, s_pos, s_v, xpack = sd.kv_geometry(kv, "TRITON_ATTN", 4 // tp)
     assert not xpack
     k = torch.arange(kv.numel(), dtype=torch.int64).view(kv.shape)
     flat = k.flatten()
-    # block 1, head 2, position 5, dim 7: its K and its V
+    # block 1, head 1, position 5, dim 7: its K and its V
     if layout == "planar":
-        want_k, want_v = k[1, 0, 5, 2 * 256 + 7], k[1, 1, 5, 2 * 256 + 7]
+        want_k, want_v = k[1, 0, 5, 256 + 7], k[1, 1, 5, 256 + 7]
     else:
-        want_k, want_v = k[1, 2, 5, 7], k[1, 2, 5, 256 + 7]
-    off = 1 * s0 + 2 * s_head + 5 * s_pos + 7
+        want_k, want_v = k[1, 1, 5, 7], k[1, 1, 5, 256 + 7]
+    off = 1 * s0 + 1 * s_head + 5 * s_pos + 7
     assert block == BLOCK
     assert flat[off] == want_k and flat[off + s_v] == want_v
 
 
-def test_kv_geometry_reads_rocm_attn_paged_layout():
+@pytest.mark.parametrize("tp", [1, 2])
+def test_kv_geometry_reads_rocm_attn_paged_layout(tp):
     """ROCM_ATTN's halves hold K [NKV][HD / 8][block][8] and V [NKV][HD][block], as
     vllm/v1/attention/ops/paged_attn.split_kv_cache views them."""
     from vllm.v1.attention.ops.paged_attn import PagedAttention
 
-    kv = _kv()
-    k_cache, v_cache = PagedAttention.split_kv_cache(kv.transpose(0, 1), 4, 256)
-    block, s0, s_head, _, s_v, xpack = sd.kv_geometry(kv, "ROCM_ATTN")
+    nkv = 4 // tp
+    kv = _kv(tp=tp)
+    k_cache, v_cache = PagedAttention.split_kv_cache(kv.transpose(0, 1), nkv, 256)
+    block, s0, s_head, _, s_v, xpack = sd.kv_geometry(kv, "ROCM_ATTN", nkv)
     assert xpack and block == BLOCK
-    b, h, p, d = 2, 3, 100, 41
+    b, h, p, d = 2, nkv - 1, 100, 41
     k_off = b * s0 + h * s_head + (d // 8) * 8 * block + p * 8 + d % 8
     v_off = b * s0 + s_v + h * s_head + d * block + p
     assert k_cache[b, h, d // 8, p, d % 8].storage_offset() == k_off

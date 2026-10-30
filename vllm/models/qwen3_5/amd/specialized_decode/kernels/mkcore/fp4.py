@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# ruff: noqa: E501
 """MXFP4 weight layout and device helpers for gfx942 (no MX MFMA).
 
 Math: v_mfma_f32_16x16x32_fp8_fp8 (e4m3fnuz). A = activations (row = token),

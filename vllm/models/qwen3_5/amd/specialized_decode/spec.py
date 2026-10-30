@@ -3,8 +3,9 @@
 """Qwen3.8-27B's specialized decode on gfx942 (MI300X / MI300A / MI325X).
 
 One persistent FlyDSL launch runs the whole decode step of the dense 27B text model
-with its MXFP4 (OCP MX, e2m1 + e8m0) linear weights, for 1 to 8 decode rows on one
-GPU. The kernels are in ``kernels/``; ``runtime/decode.py`` binds them to vLLM.
+with its MXFP4 (OCP MX, e2m1 + e8m0) linear weights, for 1 to 8 decode rows, on one
+GPU or on two (tensor parallel 2: the launch of each rank all-reduces over peer
+memory). The kernels are in ``kernels/``; ``runtime/decode.py`` binds them to vLLM.
 """
 
 from typing import TYPE_CHECKING
@@ -19,6 +20,8 @@ if TYPE_CHECKING:
 
 MAX_ROWS = 8  # the kernel's norm prologues give each row one of a CTA's 8 waves
 NKV, HEAD_DIM = 4, 256  # the attention layers' KV heads
+NVH, DV, DK, CONV_DIM = 48, 128, 128, 10240  # GDN value heads, head dims, conv channels
+TP_SIZES = (1, 2)
 # The dense Qwen3.8-27B text model the kernels are written for.
 TEXT_CONFIG = {
     "hidden_size": 5120,
@@ -69,24 +72,28 @@ def attention_backend(layer) -> str:
 
 
 def kv_geometry(
-    kv: torch.Tensor, backend: str
+    kv: torch.Tensor, backend: str, nkv: int = NKV
 ) -> tuple[int, int, int, int, int, bool] | None:
-    """(block, s0, s_head, s_pos, s_v, xpack) of an attention layer's 4-D KV view:
-    the positions a block holds, the element strides of block, head and position, the
-    elements from a K row to its V row, and whether the block interior is x-packed;
-    None for a cache the kernel cannot address.
+    """(block, s0, s_head, s_pos, s_v, xpack) of an attention layer's 4-D KV view
+    with ``nkv`` KV heads (the rank's): the positions a block holds, the element strides
+    of block, head and position, the elements from a K row to its V row, and whether
+    the block interior is x-packed; None for a cache the kernel cannot address.
 
-    TRITON_ATTN: the view is [blocks, NKV, block, 2 HD] (K | V per head) or [blocks, 2,
-    block, NKV HD] (a K and a V half per block), with any strides. ROCM_ATTN: the view
-    is [blocks, 2, block, NKV HD], but each half holds the paged-attention layout:
-    K [NKV][HD / 8][block][8] and V [NKV][HD][block] (ops/paged_attn.split_kv_cache)."""
+    TRITON_ATTN: the view is [blocks, nkv, block, 2 HD] (K | V per head) or [blocks, 2,
+    block, nkv HD] (a K and a V half per block), with any strides. ROCM_ATTN: the view
+    is [blocks, 2, block, nkv HD], but each half holds the paged-attention layout:
+    K [nkv][HD / 8][block][8] and V [nkv][HD][block] (ops/paged_attn.split_kv_cache).
+
+    At 2 KV heads (TP 2) TRITON_ATTN's two forms have the same shape; the view is read
+    per head, as vLLM's logical layer view is [blocks, heads, block, content]
+    (v1/kv_cache_layout.py) and TRITON_ATTN's content is K | V of one head."""
     if kv.dim() != 4 or kv.stride(3) != 1:
         return None
     n = kv.shape[2]
     if backend == "ROCM_ATTN":
         if (
             kv.shape[1] != 2
-            or kv.shape[3] != NKV * HEAD_DIM
+            or kv.shape[3] != nkv * HEAD_DIM
             or kv.stride(2) != kv.shape[3]
         ):
             return None
@@ -95,9 +102,9 @@ def kv_geometry(
         return n, kv.stride(0), HEAD_DIM * n, 8, kv.stride(1), True
     if backend != "TRITON_ATTN":
         return None
-    if kv.shape[1] == NKV and kv.shape[3] == 2 * HEAD_DIM:
+    if kv.shape[1] == nkv and kv.shape[3] == 2 * HEAD_DIM:
         return n, kv.stride(0), kv.stride(1), kv.stride(2), HEAD_DIM, False
-    if kv.shape[1] == 2 and kv.shape[3] == NKV * HEAD_DIM:
+    if kv.shape[1] == 2 and kv.shape[3] == nkv * HEAD_DIM:
         return n, kv.stride(0), HEAD_DIM, kv.stride(2), kv.stride(1), False
     return None
 
@@ -115,6 +122,10 @@ def _backends_missing() -> str | None:
 def _gpu_arch() -> str:
     props = torch.cuda.get_device_properties(torch.accelerator.current_device_index())
     return props.gcnArchName.split(":")[0].lower()
+
+
+def tp_size(vllm_config) -> int:
+    return vllm_config.parallel_config.tensor_parallel_size
 
 
 def _widths(vllm_config) -> tuple[int, ...]:
@@ -139,8 +150,8 @@ def _refuse_config(vllm_config) -> list[str]:
             "needs full attention in every 4th layer (3, 7, ...), "
             "linear attention elsewhere"
         )
-    if vllm_config.parallel_config.tensor_parallel_size != 1:
-        reasons.append("needs tensor parallel size 1")
+    if tp_size(vllm_config) not in TP_SIZES:
+        reasons.append(f"needs tensor parallel size 1 or 2, not {tp_size(vllm_config)}")
     if vllm_config.model_config.dtype != torch.bfloat16:
         reasons.append(
             f"needs a bf16 model dtype, not {vllm_config.model_config.dtype}"
@@ -175,7 +186,10 @@ def _refuse_model(lm) -> list[str]:
 
 
 def _refuse_caches(vllm_config, decode: "Qwen35Gfx942Decode", caches) -> list[str]:
-    """Every reason the kernel cannot address these caches."""
+    """Every reason the kernel cannot address these caches. At TP 2 a rank's caches
+    hold its half of the KV heads, the conv channels and the SSM heads."""
+    tp = tp_size(vllm_config)
+    nkv, nvh, conv_dim = NKV // tp, NVH // tp, CONV_DIM // tp
     reasons = []
     sfc = vllm_config.compilation_config.static_forward_context
     geometries = set()
@@ -185,7 +199,7 @@ def _refuse_caches(vllm_config, decode: "Qwen35Gfx942Decode", caches) -> list[st
             reasons.append(f"{name}: needs a bf16 KV tensor")
             continue
         backend = attention_backend(sfc[name])
-        geometry = kv_geometry(kv, backend)
+        geometry = kv_geometry(kv, backend, nkv)
         if geometry is None:
             reasons.append(
                 f"{name}: {backend} KV view {tuple(kv.shape)} strides {kv.stride()} "
@@ -202,8 +216,8 @@ def _refuse_caches(vllm_config, decode: "Qwen35Gfx942Decode", caches) -> list[st
         conv, ssm = st
         if (
             conv.dtype != torch.bfloat16
-            or conv.shape[1:] != (3, 10240)
-            or conv.stride()[1:] != (10240, 1)
+            or conv.shape[1:] != (3, conv_dim)
+            or conv.stride()[1:] != (conv_dim, 1)
         ):
             reasons.append(
                 f"{name}: conv state {tuple(conv.shape)} {conv.dtype} "
@@ -211,7 +225,7 @@ def _refuse_caches(vllm_config, decode: "Qwen35Gfx942Decode", caches) -> list[st
             )
         if (
             ssm.dtype != torch.float32
-            or ssm.shape[1:] != (48, 128, 128)
+            or ssm.shape[1:] != (nvh, DV, DK)
             or not ssm[0].is_contiguous()
         ):
             reasons.append(
