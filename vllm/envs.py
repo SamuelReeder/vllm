@@ -216,6 +216,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
+    VLLM_SPECIALIZED_DECODE_LAUNCH: str = "flydsl"
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1671,6 +1672,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use the SM100 BF16 GEMM-AR kernel for eligible Kimi-K3 row-parallel
     # attention projections. All TP ranks must belong to one NVLink domain.
     "VLLM_KIMI_K3_GEMM_AR": lambda: bool(int(os.getenv("VLLM_KIMI_K3_GEMM_AR", "1"))),
+    # Launch backend of the ROCm megakernel specialized decodes (gfx942):
+    # "flydsl" JIT-compiles the FlyDSL kernel in process; "hipdnn" launches the
+    # prebuilt code object through hipdnn_vllm's custom op (needs custom_op in
+    # HIPDNN_VLLM_OPS). See vllm/models/common/specialized_decode/hipdnn_launch.py.
+    "VLLM_SPECIALIZED_DECODE_LAUNCH": env_with_choices(
+        "VLLM_SPECIALIZED_DECODE_LAUNCH", "flydsl", ["flydsl", "hipdnn"]
+    ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3
     # attention/shared-expert projections, DeepSeek-V4.1 ``wo_b``). All TP

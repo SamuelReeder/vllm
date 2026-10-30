@@ -14,19 +14,23 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from vllm.models.common.specialized_decode.hipdnn_launch import refuse_launch
 from vllm.models.common.specialized_decode.spec import DecodeSpec
 from vllm.models.qwen3_5.amd.specialized_decode.spec import (
     _backends_missing,
     _gpu_arch,
-    _skip_step,
     _widths,
     attention_backend,
     kv_geometry,
+)
+from vllm.models.qwen3_5.amd.specialized_decode.spec import (
+    _skip_step as _decode_only_skip_step,
 )
 
 if TYPE_CHECKING:
     from .runtime.decode import Qwen35MoeGfx942Decode
 
+NAME = "qwen36-35b-a3b-fp8-gfx942"  # also the hipDNN op id's model (hipdnn_launch.py)
 LAYERS = 40  # layer i is full attention iff i % 4 == 3
 NKV, HEAD_DIM = 2, 256  # the attention layers' KV heads
 CONV_DIM, NVH, DK = 8192, 32, 128  # GDN conv channels (q | k | v), V heads, head dim
@@ -163,7 +167,7 @@ def _refuse_config(vllm_config) -> list[str]:
     missing = _backends_missing()
     if missing is not None:
         reasons.append(f"needs FlyDSL and AITER's FlyDSL helpers ({missing})")
-    return reasons
+    return reasons + refuse_launch()
 
 
 def _refuse_model(lm) -> list[str]:
@@ -249,6 +253,14 @@ def _refuse_caches(vllm_config, decode: "Qwen35MoeGfx942Decode", caches) -> list
     return reasons
 
 
+def _skip_step(vllm_config, decode: "Qwen35MoeGfx942Decode", width: int) -> str | None:
+    """Why this step keeps vLLM's path: a width without a launch (hipDNN can decline a
+    width at warm-up), or a step that is not decode-only (Qwen3.8's checks)."""
+    if decode.hipdnn is not None and (why := decode.hipdnn.declined(width)):
+        return why
+    return _decode_only_skip_step(vllm_config, decode, width)
+
+
 def _build(vllm_config, lm, widths: tuple[int, ...]) -> "Qwen35MoeGfx942Decode":
     from .runtime.decode import Qwen35MoeGfx942Decode
 
@@ -256,7 +268,7 @@ def _build(vllm_config, lm, widths: tuple[int, ...]) -> "Qwen35MoeGfx942Decode":
 
 
 DECODE_SPEC = DecodeSpec["Qwen35MoeGfx942Decode"](
-    name="qwen36-35b-a3b-fp8-gfx942",
+    name=NAME,
     supports=frozenset(),
     widths=_widths,
     refuse_config=_refuse_config,

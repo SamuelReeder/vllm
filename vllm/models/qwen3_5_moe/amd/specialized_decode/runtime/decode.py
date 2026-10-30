@@ -18,6 +18,7 @@ KV and selects no routed expert.
 """
 
 import dataclasses
+import pathlib
 from collections.abc import Mapping
 from typing import Any
 
@@ -25,6 +26,13 @@ import torch
 
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
+from vllm.models.common.specialized_decode.hipdnn_launch import (
+    HIPDNN,
+    HipdnnLaunch,
+    kv_class,
+    launch_backend,
+    payload,
+)
 from vllm.models.common.specialized_decode.spec import Step
 
 from ..kernels import kernel as KK
@@ -43,7 +51,8 @@ from ..kernels.dims import (
     H,
     is_attn,
 )
-from ..spec import HEAD_DIM, attention_backend, kv_geometry
+from ..kernels.mkcore import key as KEY
+from ..spec import HEAD_DIM, NAME, attention_backend, kv_geometry
 from .weights import PackedWeights
 
 logger = init_logger(__name__)
@@ -88,6 +97,8 @@ class Qwen35MoeGfx942Decode:
         self.maxlen = vllm_config.model_config.max_model_len
         self.cus = torch.cuda.get_device_properties(device).multi_processor_count
         self.chunks = default_chunks()
+        # the launch backend (hipdnn_launch.py); None: the FlyDSL JIT launch
+        self.hipdnn = HipdnnLaunch(NAME) if launch_backend() == HIPDNN else None
         self.weights = PackedWeights(layers, self.chunks)
         Mx = max(widths)
         z = lambda *s, dt=torch.float32: torch.zeros(*s, dtype=dt, device=device)  # noqa: E731
@@ -171,7 +182,8 @@ class Qwen35MoeGfx942Decode:
             assert cfg.chunks() == self.chunks, (cfg.chunks(), self.chunks)
             if self.cfgs.get(w) != cfg:
                 self.cfgs[w] = cfg
-                self.launches[w] = KK.build(cfg)
+                if self.hipdnn is None:  # hipDNN launches prebuilt code objects
+                    self.launches[w] = KK.build(cfg)
         Mx = max(self.widths)
         cfg = self.cfgs[Mx]
         self.part = torch.zeros(
@@ -243,6 +255,28 @@ class Qwen35MoeGfx942Decode:
             tab[i, KK.T_IN_LN] = sm("input_layernorm.weight")
             tab[i, KK.T_POST_LN] = sm("post_attention_layernorm.weight")
         self.tab = tab.to(self.device)
+        if self.hipdnn is not None:
+            # before CUDA graph capture: one plan per width
+            kdir = pathlib.Path(KK.__file__).resolve().parent
+            arch = torch.cuda.get_device_properties(self.device).gcnArchName
+            tp = self.vllm_config.parallel_config.tensor_parallel_size
+            self.hipdnn.prepare(
+                {
+                    w: payload(
+                        NAME,
+                        c,
+                        KEY.compile_key,
+                        kdir,
+                        arch=arch.split(":")[0],
+                        kv=kv_class(backend, kv0, NKV, HEAD_DIM),
+                        block=block,
+                        tp=tp,
+                        nlayers=NL,
+                    )
+                    for w, c in self.cfgs.items()
+                },
+                [self.tab, self.glob],
+            )
         logger.info(
             "Qwen3.6-35B-A3B gfx942 decode: %s KV block %d, %d block-table columns, "
             "%d attention and %d GDN cache groups, widths %s",
@@ -289,12 +323,16 @@ class Qwen35MoeGfx942Decode:
 
     def launch(self, width: int, glob: torch.Tensor, layers: int = NL) -> torch.Tensor:
         assert self.tab is not None
-        self.launches[width](
-            self.tab.data_ptr(),
-            glob.data_ptr(),
-            layers,
-            stream=torch.cuda.current_stream(),
-        )
+        if self.hipdnn is not None:
+            assert layers == NL, "the hipDNN payload launches every layer"
+            self.hipdnn.launch(width, [self.tab, glob])
+        else:
+            self.launches[width](
+                self.tab.data_ptr(),
+                glob.data_ptr(),
+                layers,
+                stream=torch.cuda.current_stream(),
+            )
         return self.out[:width]
 
     def run(self, step: Step, input_ids, inputs_embeds, **kwargs) -> torch.Tensor:
